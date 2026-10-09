@@ -1,5 +1,5 @@
 <script setup>
-import { nextTick, onBeforeUnmount, ref } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   startSession,
   pushChunk,
@@ -16,11 +16,11 @@ const status = ref("idle"); // idle | listening | finishing | error | done
 const statusText = ref("未开始");
 const language = ref("—");
 const asrText = ref(""); // live ASR recognition
-const inputText = ref(""); // textarea (editable before sending)
 const messages = ref([]); // {role, content} conversation
 const sending = ref(false);
 const error = ref("");
 const logEl = ref(null);
+const asrEl = ref(null);
 
 const autoPlay = ref(true); // auto-speak each assistant reply
 const ttsState = ref("idle"); // idle | synthesizing | playing | done
@@ -34,6 +34,7 @@ let sessionId = null;
 let running = false;
 let buf = new Float32Array(0);
 let pushing = false;
+let holdActive = false; // pointer/key currently held for push-to-talk
 
 function setStatus(s, label) {
   status.value = s;
@@ -57,6 +58,18 @@ async function scrollLog() {
   if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight;
 }
 
+async function scrollAsr() {
+  await nextTick();
+  if (asrEl.value) asrEl.value.scrollTop = asrEl.value.scrollHeight;
+}
+
+// Stop any TTS playback.
+function stopSpeak() {
+  stopPlayback();
+  playingIndex.value = -1;
+  ttsState.value = "idle";
+}
+
 // Synthesize + stream-play one message's text.
 async function speak(index) {
   const msg = messages.value[index];
@@ -77,30 +90,22 @@ async function speak(index) {
   }
 }
 
-function stopSpeak() {
-  stopPlayback();
-  playingIndex.value = -1;
-  ttsState.value = "idle";
-}
-
-// Send text (from ASR or typed) to the LLM and show the reply.
+// Send recognized text to the LLM and show + speak the reply.
 async function sendToLLM(text) {
-  const content = (text ?? inputText.value).trim();
+  const content = (text || "").trim();
   if (!content) return;
   error.value = "";
   sending.value = true;
   messages.value.push({ role: "user", content });
-  inputText.value = "";
+  // Clear the live-recognition box once the text has been sent.
+  asrText.value = "";
   scrollLog();
   try {
     const sid = await ensureSession();
     const reply = await chat(sid, content);
     messages.value.push({ role: "assistant", content: reply });
     scrollLog();
-    if (autoPlay.value) {
-      // Fire-and-forget: playback streams in the background.
-      speak(messages.value.length - 1);
-    }
+    if (autoPlay.value) speak(messages.value.length - 1);
   } catch (err) {
     error.value = err.message;
     setStatus("error", "LLM 调用失败");
@@ -133,6 +138,7 @@ async function pump() {
       const j = await pushChunk(sessionId, chunk);
       language.value = j.language || "—";
       asrText.value = j.text || "";
+      scrollAsr();
     }
   } catch (err) {
     error.value = err.message;
@@ -145,6 +151,9 @@ async function pump() {
 
 async function startRecording() {
   if (running) return;
+  // Barge-in: if the assistant is speaking, cut it off before we record, so the
+  // mic doesn't pick up the TTS output.
+  if (playingIndex.value !== -1 || ttsState.value !== "idle") stopSpeak();
   error.value = "";
   asrText.value = "";
   language.value = "—";
@@ -179,8 +188,14 @@ async function startRecording() {
     source.connect(processor);
     processor.connect(audioCtx.destination);
 
+    // The user may have released the button while getUserMedia was resolving.
+    if (!holdActive) {
+      await stopPipeline();
+      return;
+    }
+
     running = true;
-    setStatus("listening", "识别中…");
+    setStatus("listening", "正在说话…");
   } catch (err) {
     error.value = err.message;
     setStatus("error", "启动失败");
@@ -192,14 +207,13 @@ async function startRecording() {
 async function stopRecording() {
   if (!running) return;
   running = false;
-  setStatus("finishing", "收尾中…");
+  setStatus("finishing", "识别中…");
   await stopPipeline();
   try {
     const j = await finishSession(sessionId);
     language.value = j.language || "—";
     asrText.value = j.text || "";
-    setStatus("done", "已停止");
-    // Auto-send the recognized text to the LLM.
+    setStatus("done", "已识别");
     if (asrText.value.trim()) await sendToLLM(asrText.value);
   } catch (err) {
     error.value = err.message;
@@ -210,65 +224,46 @@ async function stopRecording() {
   }
 }
 
-// ---- File upload path ----
-const fileInput = ref(null);
-const fileBusy = ref(false);
+// ---- Push-to-talk: press to start, release to finish ----
+function onHoldStart() {
+  if (holdActive) return;
+  holdActive = true;
+  startRecording();
+}
+function onHoldEnd() {
+  if (!holdActive) return;
+  holdActive = false;
+  stopRecording();
+}
 
-async function onFilePicked(e) {
-  const file = e.target.files?.[0];
-  if (!file) return;
-  error.value = "";
-  asrText.value = "";
-  language.value = "—";
-  fileBusy.value = true;
-  setStatus("listening", "上传识别中…");
-
-  try {
-    const arrayBuf = await file.arrayBuffer();
-    const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const audioBuf = await decodeCtx.decodeAudioData(arrayBuf);
-    await decodeCtx.close();
-
-    const ch = audioBuf.numberOfChannels;
-    const len = audioBuf.length;
-    const mono = new Float32Array(len);
-    for (let c = 0; c < ch; c++) {
-      const data = audioBuf.getChannelData(c);
-      for (let i = 0; i < len; i++) mono[i] += data[i] / ch;
-    }
-    const pcm16k = resampleLinear(mono, audioBuf.sampleRate, TARGET_SR);
-
-    const sid = await ensureSession();
-    const chunkSamples = Math.round(TARGET_SR * (CHUNK_MS / 1000));
-    for (let off = 0; off < pcm16k.length; off += chunkSamples) {
-      const chunk = pcm16k.slice(off, off + chunkSamples);
-      const j = await pushChunk(sid, chunk);
-      language.value = j.language || "—";
-      asrText.value = j.text || "";
-    }
-    const j = await finishSession(sid);
-    language.value = j.language || "—";
-    asrText.value = j.text || "";
-    setStatus("done", "识别完成");
-    if (asrText.value.trim()) await sendToLLM(asrText.value);
-  } catch (err) {
-    error.value = err.message;
-    setStatus("error", "识别失败");
-  } finally {
-    fileBusy.value = false;
-    if (fileInput.value) fileInput.value.value = "";
+// Keyboard hold (Space) mirrors the button for desktop users.
+function onKey(e) {
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea") return;
+  if (e.code === "Space") {
+    e.preventDefault();
+    if (e.type === "keydown" && !e.repeat) onHoldStart();
+    else if (e.type === "keyup") onHoldEnd();
+  } else if (e.code === "Escape") {
+    e.preventDefault();
+    stopSpeak();
   }
 }
 
 function clearAll() {
   messages.value = [];
   asrText.value = "";
-  inputText.value = "";
   language.value = "—";
   error.value = "";
 }
 
+onMounted(() => {
+  window.addEventListener("keydown", onKey);
+  window.addEventListener("keyup", onKey);
+});
 onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKey);
+  window.removeEventListener("keyup", onKey);
   running = false;
   stopPipeline();
   stopPlayback();
@@ -283,68 +278,58 @@ onBeforeUnmount(() => {
       <div class="row">
         <span class="pill" :class="status">{{ statusText }}</span>
         <span class="pill">语言: {{ language }}</span>
-        <span v-if="ttsState !== 'idle'" class="pill" :class="ttsState === 'playing' ? 'listening' : 'finishing'">
+        <span
+          v-if="ttsState !== 'idle'"
+          class="pill"
+          :class="ttsState === 'playing' ? 'listening' : 'finishing'"
+        >
           🔊 {{ ttsState === "synthesizing" ? "合成中…" : ttsState === "playing" ? "播放中…" : "播放完成" }}
         </span>
       </div>
 
+      <div class="ptt-area">
+        <button
+          class="ptt"
+          :class="{ recording: running }"
+          @pointerdown.prevent="onHoldStart"
+          @pointerup.prevent="onHoldEnd"
+          @pointerleave="onHoldEnd"
+          @pointercancel="onHoldEnd"
+          @contextmenu.prevent
+        >
+          <span class="ptt-icon">{{ running ? "🔴" : "🎙" }}</span>
+          <span class="ptt-label">{{ running ? "松开结束" : "按住说话" }}</span>
+        </button>
+        <div class="asr-col">
+          <textarea
+            ref="asrEl"
+            id="live-asr"
+            readonly
+            rows="3"
+            :value="asrText"
+            placeholder="实时识别内容会显示在这里…"
+          ></textarea>
+          <div class="hint">
+            按住说话，松开即识别并回复 · 播放中按住可打断 · 键盘长按 <kbd>空格</kbd>
+          </div>
+        </div>
+      </div>
+
       <div class="row">
-        <button class="primary" :disabled="running || fileBusy" @click="startRecording">
-          🎙 开始录音
-        </button>
-        <button class="danger" :disabled="!running" @click="stopRecording">
-          ⏹ 停止
-        </button>
-        <label class="filebtn">
-          📁 上传音频
-          <input
-            ref="fileInput"
-            type="file"
-            accept="audio/*"
-            :disabled="running || fileBusy"
-            @change="onFilePicked"
-          />
-        </label>
-        <button @click="clearAll">清空</button>
+        <button @click="clearAll">清空对话</button>
         <label class="toggle">
           <input type="checkbox" v-model="autoPlay" />
           自动朗读回复
         </label>
-        <button class="danger" :disabled="playingIndex === -1" @click="stopSpeak">
-          ⏹ 停止播放
-        </button>
-      </div>
-
-      <div class="panel">
-        <div class="label">识别结果（可编辑后发送）</div>
-        <textarea
-          id="asr"
-          v-model="inputText"
-          rows="3"
-          placeholder="录音停止后识别结果会自动填入，也可以直接打字…"
-        ></textarea>
-        <div class="row" style="margin-top: 8px">
-          <button class="primary" :disabled="sending || !inputText.trim()" @click="sendToLLM()">
-            {{ sending ? "思考中…" : "发送 → LLM" }}
-          </button>
-          <span v-if="asrText && asrText !== inputText" class="pill">
-            原始识别: {{ asrText }}
-          </span>
-        </div>
       </div>
 
       <div class="panel chatpanel">
         <div class="label">对话</div>
         <div id="log" ref="logEl">
           <div v-if="!messages.length" class="empty">
-            录音或打字后发送，LLM 会以「台湾知心朋友」角色回复…
+            按住下方按钮说话，LLM 会以「台湾知心朋友」角色回复…
           </div>
-          <div
-            v-for="(m, i) in messages"
-            :key="i"
-            class="msg"
-            :class="m.role"
-          >
+          <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
             <span class="who">{{ m.role === "user" ? "我" : "她" }}</span>
             <span class="body">{{ m.content }}</span>
             <button
@@ -368,7 +353,7 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .wrap {
-  min-height: 100vh;
+  height: 100vh;
   padding: 16px;
   box-sizing: border-box;
   display: flex;
@@ -376,6 +361,7 @@ onBeforeUnmount(() => {
 .card {
   width: 100%;
   max-width: 860px;
+  height: 100%;
   margin: 0 auto;
   background: #fff;
   border: 1px solid #e5e7eb;
@@ -386,6 +372,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  overflow: hidden;
 }
 h1 {
   font-size: 18px;
@@ -413,14 +400,6 @@ button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
-button.primary {
-  border-color: rgba(5, 150, 105, 0.35);
-  background: rgba(5, 150, 105, 0.1);
-}
-button.danger {
-  border-color: rgba(225, 29, 72, 0.35);
-  background: rgba(225, 29, 72, 0.1);
-}
 .pill {
   font-size: 12px;
   padding: 6px 10px;
@@ -444,20 +423,91 @@ button.danger {
   border-color: rgba(225, 29, 72, 0.35);
   background: rgba(225, 29, 72, 0.1);
 }
-.filebtn {
+.ptt-area {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 4px 0;
+}
+.ptt {
+  flex: none;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 110px;
+  height: 110px;
+  border-radius: 50%;
+  border: 2px solid rgba(5, 150, 105, 0.35);
+  background: rgba(5, 150, 105, 0.1);
+  color: #065f46;
+  font-weight: 800;
+  user-select: none;
+  touch-action: none;
+  transition: transform 0.08s ease, background 0.15s ease;
+}
+.ptt:hover {
+  background: rgba(5, 150, 105, 0.16);
+}
+.ptt:active {
+  transform: scale(0.97);
+}
+.ptt.recording {
+  border-color: rgba(225, 29, 72, 0.5);
+  background: rgba(225, 29, 72, 0.12);
+  color: #9f1239;
+}
+.ptt-icon {
+  font-size: 30px;
+}
+.ptt-label {
+  font-size: 13px;
+}
+.asr-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hint {
+  font-size: 12px;
+  color: #94a3b8;
+  text-align: center;
+}
+#live-asr {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 15px;
+  line-height: 1.6;
+  font-family: inherit;
+  box-sizing: border-box;
+  background: #f8fafc;
+  color: #0f172a;
+}
+#live-asr::placeholder {
+  color: #94a3b8;
+}
+.hint kbd {
+  background: #f1f5f9;
+  border: 1px solid #e5e7eb;
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+}
+.toggle {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  border: 1px solid #e5e7eb;
-  border-radius: 12px;
-  padding: 10px 14px;
+  font-size: 13px;
+  color: #5b6472;
   cursor: pointer;
-  background: #f8fafc;
-  font-weight: 700;
-  color: #0f172a;
-}
-.filebtn input {
-  display: none;
+  user-select: none;
 }
 .panel {
   border: 1px solid #e5e7eb;
@@ -467,27 +517,18 @@ button.danger {
 }
 .chatpanel {
   flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  min-height: 240px;
 }
 .label {
   color: #5b6472;
   font-size: 12px;
   margin-bottom: 6px;
 }
-#asr {
-  width: 100%;
-  resize: vertical;
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  padding: 10px;
-  font-size: 15px;
-  font-family: inherit;
-  box-sizing: border-box;
-}
 #log {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -522,15 +563,6 @@ button.danger {
   line-height: 1.6;
   font-size: 15px;
   flex: 1;
-}
-.toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: #5b6472;
-  cursor: pointer;
-  user-select: none;
 }
 .playbtn {
   flex: none;
