@@ -1,14 +1,15 @@
-// Client for the Qwen3-ASR streaming protocol (relayed by the backend proxy).
+// Client for the backend voice-chat API.
 //
-// Protocol:
-//   POST /api/start                    -> { session_id }
-//   POST /api/chunk?session_id=<id>    -> { language, text }   body: raw float32 PCM @16k mono
-//   POST /api/finish?session_id=<id>   -> { language, text }
+// Backend endpoints (see backend/main.py):
+//   POST /api/session/start   -> { session_id, asr_session_id }
+//   POST /api/chunk?session_id=<id>   body: raw float32 PCM @16k mono -> {language, text}
+//   POST /api/finish?session_id=<id>  -> {language, text}
+//   POST /api/chat  {session_id, text} -> {reply}
 
 const BASE = "/api";
 
 export async function startSession() {
-  const r = await fetch(`${BASE}/start`, { method: "POST" });
+  const r = await fetch(`${BASE}/session/start`, { method: "POST" });
   if (!r.ok) throw new Error(`start failed: ${r.status} ${await r.text()}`);
   const j = await r.json();
   if (!j.session_id) throw new Error("start returned no session_id");
@@ -35,6 +36,16 @@ export async function finishSession(sessionId) {
   );
   if (!r.ok) throw new Error(`finish failed: ${r.status} ${await r.text()}`);
   return await r.json();
+}
+
+export async function chat(sessionId, text) {
+  const r = await fetch(`${BASE}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, text }),
+  });
+  if (!r.ok) throw new Error(`chat failed: ${r.status} ${await r.text()}`);
+  return (await r.json()).reply;
 }
 
 // Linear resample a Float32Array from srcSr to dstSr.

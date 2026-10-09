@@ -1,49 +1,35 @@
-"""Thin async proxy in front of the remote Qwen3-ASR streaming service.
+"""Backend for the voice-chat pipeline.
 
-The remote service (default http://36.212.51.208:9020) exposes a session-based
-streaming protocol:
+Relays the remote Qwen3-ASR streaming service and the OpenAI-compatible LLM,
+keeping per-session state (ASR session id + conversation history) in `session.py`.
 
-    POST /api/start                       -> {"session_id": "..."}
-    POST /api/chunk?session_id=<id>       -> {"language": "...", "text": "..."}
-         body: raw little-endian float32 PCM, 16 kHz, mono
-    POST /api/finish?session_id=<id>      -> {"language": "...", "text": "..."}
-
-The remote service sends no CORS headers, so a browser cannot call it directly.
-This backend relays those calls and adds CORS so the Vue frontend can reach it.
+Frontend flow:
+  POST /api/session/start   -> create session + start ASR  -> {session_id}
+  POST /api/chunk           -> stream float32 PCM to ASR    -> {language, text}
+  POST /api/finish          -> finish ASR                   -> {language, text}
+  POST /api/chat            -> send text to LLM (role prompt)-> {reply}
+  POST /api/tts             -> synthesize speech (streaming PCM)
 """
 
 from __future__ import annotations
 
-import os
-
 import httpx
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
-load_dotenv()
-
-ASR_BASE_URL = os.getenv("ASR_BASE_URL", "http://36.212.51.208:9020").rstrip("/")
-CORS_ORIGINS = [
-    o.strip()
-    for o in os.getenv(
-        "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
-    ).split(",")
-    if o.strip()
-]
+import config
+from session import sessions
 
 # Long read timeout: a chunk call blocks until the remote returns a transcript.
-client = httpx.AsyncClient(
-    base_url=ASR_BASE_URL,
-    timeout=httpx.Timeout(60.0, connect=10.0),
-)
+client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
 
-app = FastAPI(title="Qwen3-ASR Proxy", version="0.1.0")
+app = FastAPI(title="Voice Chat Backend", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS or ["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,33 +41,124 @@ async def _shutdown() -> None:
     await client.aclose()
 
 
+# TTS sample rate is advertised by the remote service; fetch once at startup.
+TTS_SAMPLE_RATE = 24000
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global TTS_SAMPLE_RATE
+    try:
+        r = await client.get(f"{config.TTS_BASE_URL}/health", timeout=10.0)
+        TTS_SAMPLE_RATE = int(r.json().get("sample_rate", 24000))
+    except Exception:
+        pass
+
+
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "asr_base_url": ASR_BASE_URL}
+    return {
+        "status": "ok",
+        "asr": config.ASR_BASE_URL,
+        "llm": config.LLM_BASE_URL,
+        "tts": config.TTS_BASE_URL,
+        "model": config.LLM_MODEL_ID,
+    }
 
 
-@app.post("/api/start")
-async def start() -> JSONResponse:
-    r = await client.post("/api/start")
-    return JSONResponse(r.json(), status_code=r.status_code)
+# ---- session lifecycle ----
+@app.post("/api/session/start")
+async def session_start() -> JSONResponse:
+    s = sessions.create()
+    try:
+        await s.asr_start(client)
+    except httpx.HTTPError as e:
+        sessions.delete(s.id)
+        raise HTTPException(status_code=502, detail=f"ASR start failed: {e}")
+    return JSONResponse({"session_id": s.id, "asr_session_id": s.asr_session_id})
 
 
+def _get_session(session_id: str):
+    s = sessions.get(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return s
+
+
+# ---- ASR relay ----
 @app.post("/api/chunk")
 async def chunk(request: Request, session_id: str) -> JSONResponse:
+    s = _get_session(session_id)
     body = await request.body()
-    r = await client.post(
-        "/api/chunk",
-        params={"session_id": session_id},
-        content=body,
-        headers={"Content-Type": "application/octet-stream"},
-    )
-    return JSONResponse(r.json(), status_code=r.status_code)
+    try:
+        j = await s.asr_chunk(client, body)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"ASR chunk failed: {e}")
+    return JSONResponse(j)
 
 
 @app.post("/api/finish")
-async def finish(request: Request, session_id: str) -> JSONResponse:
-    r = await client.post("/api/finish", params={"session_id": session_id})
-    return JSONResponse(r.json(), status_code=r.status_code)
+async def finish(session_id: str) -> JSONResponse:
+    s = _get_session(session_id)
+    try:
+        j = await s.asr_finish(client)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"ASR finish failed: {e}")
+    return JSONResponse(j)
+
+
+# ---- LLM chat ----
+class ChatReq(BaseModel):
+    session_id: str
+    text: str
+
+
+@app.post("/api/chat")
+async def chat(req: ChatReq) -> JSONResponse:
+    s = _get_session(req.session_id)
+    try:
+        reply = await s.chat(client, req.text)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+    return JSONResponse({"reply": reply})
+
+
+# ---- TTS (streaming PCM) ----
+class TtsReq(BaseModel):
+    text: str
+
+
+@app.post("/api/tts")
+async def tts(req: TtsReq) -> StreamingResponse:
+    """Relay the remote TTS service's streaming PCM (16-bit mono @ sample_rate)."""
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+
+    form = {"text": text}
+    if config.TTS_PROMPT:
+        form["instruction"] = config.TTS_PROMPT
+
+    async def relay():
+        async with client.stream(
+            "POST",
+            f"{config.TTS_BASE_URL}/v1/audio/speech",
+            data=form,
+            timeout=httpx.Timeout(120.0, connect=10.0),
+        ) as upstream:
+            if upstream.status_code != 200:
+                detail = (await upstream.aread()).decode(errors="replace")
+                raise HTTPException(
+                    status_code=502, detail=f"TTS failed: {upstream.status_code} {detail}"
+                )
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+
+    return StreamingResponse(
+        relay(),
+        media_type="audio/pcm",
+        headers={"X-Sample-Rate": str(TTS_SAMPLE_RATE)},
+    )
 
 
 if __name__ == "__main__":

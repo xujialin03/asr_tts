@@ -1,0 +1,23 @@
+# Copy to config.yaml at the repo root and fill in your service addresses.
+services:
+  asr:
+    host: 127.0.0.1
+    port: 9020
+  tts:
+    name: breeze-tts-2
+    host: 127.0.0.1
+    port: 7860
+  llm:
+    host: 127.0.0.1
+    port: 9090
+
+llm:
+  model_id: your-model-id
+  api_key: empty
+  temperature: 0.7
+  role_prompt: |
+    # Role: 你的角色设定
+    在这里写系统提示词（人设、互动方式、语言风格）。
+
+tts:
+  prompt: "音色/语气提示词"

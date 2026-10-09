@@ -24,6 +24,39 @@ frontend/   Vue 3 + Vite 前端
 | POST | `/api/chunk?session_id=<id>` | body 为原始 float32 PCM, 16kHz, 单声道；返回 `{language, text}` |
 | POST | `/api/finish?session_id=<id>` | 结束会话，返回最终 `{language, text}` |
 
+## 远程 TTS 协议（流式）
+
+TTS 同样是流式服务：响应为 `Transfer-Encoding: chunked`，可边生成边读取播放。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | 返回 `{status, sample_rate}`（当前 `sample_rate: 24000`） |
+| POST | `/v1/audio/speech` | 合成语音，**multipart/form-data**；响应为裸 PCM 音频流 |
+
+请求字段（multipart form）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `text` | string | ✅ | 要合成的文本 |
+| `instruction` | string | ❌ | 音色/语气提示词（见 `config.yaml` 的 `tts.prompt`） |
+| `ref_audio` | file | ❌ | 参考音频（克隆音色用） |
+| `ref_text` | string | ❌ | 参考音频对应文本 |
+| `cfg_scale` | number | ❌ | 默认 1.0 |
+| `seed` | integer | ❌ | 默认 42 |
+
+响应：`content-type: audio/pcm`，**裸 PCM（无 WAV 头），16-bit 单声道，24000Hz**，chunked 流式。播放前需补 WAV 头或按该格式解码。
+
+curl 示例：
+
+```bash
+curl -X POST "http://<tts-host>:<tts-port>/v1/audio/speech" \
+  -F 'text=你好，这是一段语音合成测试。' \
+  -F 'instruction=一位温柔自信的年轻女性，声音清晰，语气亲切' \
+  -o out.pcm
+```
+
+> 服务地址与端口见 `config.yaml`（`services.tts`）。
+
 ## 运行
 
 ### 1. 后端（uv）
