@@ -21,3 +21,7 @@ llm:
 
 tts:
   prompt: "音色/语气提示词"
+  # 固定参考音频（zero-shot 音色克隆），用于锁定音色。路径相对 backend/ 目录。
+  # ref_text 是参考音频对应的文字，可用 ASR 服务转写得到。
+  ref_audio: assets/ref_voice.wav
+  ref_text: "参考音频对应的文字内容"

@@ -43,16 +43,24 @@ async def _shutdown() -> None:
 
 # TTS sample rate is advertised by the remote service; fetch once at startup.
 TTS_SAMPLE_RATE = 24000
+# Reference audio (for voice cloning) loaded once into memory.
+TTS_REF_BYTES: bytes | None = None
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global TTS_SAMPLE_RATE
+    global TTS_SAMPLE_RATE, TTS_REF_BYTES
     try:
         r = await client.get(f"{config.TTS_BASE_URL}/health", timeout=10.0)
         TTS_SAMPLE_RATE = int(r.json().get("sample_rate", 24000))
     except Exception:
         pass
+    if config.TTS_REF_AUDIO:
+        try:
+            with open(config.TTS_REF_AUDIO, "rb") as f:
+                TTS_REF_BYTES = f.read()
+        except OSError:
+            TTS_REF_BYTES = None
 
 
 @app.get("/health")
@@ -139,11 +147,19 @@ async def tts(req: TtsReq) -> StreamingResponse:
     if config.TTS_PROMPT:
         form["instruction"] = config.TTS_PROMPT
 
+    # Attach the fixed reference audio + its transcript so the cloned voice
+    # stays consistent across every request.
+    files = None
+    if TTS_REF_BYTES:
+        form["ref_text"] = config.TTS_REF_TEXT
+        files = {"ref_audio": ("ref_voice.wav", TTS_REF_BYTES, "audio/wav")}
+
     async def relay():
         async with client.stream(
             "POST",
             f"{config.TTS_BASE_URL}/v1/audio/speech",
             data=form,
+            files=files,
             timeout=httpx.Timeout(120.0, connect=10.0),
         ) as upstream:
             if upstream.status_code != 200:

@@ -41,3 +41,8 @@ LLM_ROLE_PROMPT = _llm.get("role_prompt", "")
 
 _tts = _cfg.get("tts", {})
 TTS_PROMPT = _tts.get("prompt", "")
+TTS_REF_TEXT = _tts.get("ref_text", "")
+
+# ref_audio is stored relative to the backend dir (e.g. assets/ref_voice.wav).
+_ref = _tts.get("ref_audio", "")
+TTS_REF_AUDIO = str(Path(__file__).resolve().parent / _ref) if _ref else ""
