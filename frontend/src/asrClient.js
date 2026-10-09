@@ -1,0 +1,54 @@
+// Client for the Qwen3-ASR streaming protocol (relayed by the backend proxy).
+//
+// Protocol:
+//   POST /api/start                    -> { session_id }
+//   POST /api/chunk?session_id=<id>    -> { language, text }   body: raw float32 PCM @16k mono
+//   POST /api/finish?session_id=<id>   -> { language, text }
+
+const BASE = "/api";
+
+export async function startSession() {
+  const r = await fetch(`${BASE}/start`, { method: "POST" });
+  if (!r.ok) throw new Error(`start failed: ${r.status} ${await r.text()}`);
+  const j = await r.json();
+  if (!j.session_id) throw new Error("start returned no session_id");
+  return j.session_id;
+}
+
+export async function pushChunk(sessionId, float32_16k) {
+  const r = await fetch(
+    `${BASE}/chunk?session_id=${encodeURIComponent(sessionId)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: float32_16k.buffer,
+    }
+  );
+  if (!r.ok) throw new Error(`chunk failed: ${r.status} ${await r.text()}`);
+  return await r.json();
+}
+
+export async function finishSession(sessionId) {
+  const r = await fetch(
+    `${BASE}/finish?session_id=${encodeURIComponent(sessionId)}`,
+    { method: "POST" }
+  );
+  if (!r.ok) throw new Error(`finish failed: ${r.status} ${await r.text()}`);
+  return await r.json();
+}
+
+// Linear resample a Float32Array from srcSr to dstSr.
+export function resampleLinear(input, srcSr, dstSr) {
+  if (srcSr === dstSr) return input;
+  const ratio = dstSr / srcSr;
+  const outLen = Math.max(0, Math.round(input.length * ratio));
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const x = i / ratio;
+    const x0 = Math.floor(x);
+    const x1 = Math.min(x0 + 1, input.length - 1);
+    const t = x - x0;
+    out[i] = input[x0] * (1 - t) + input[x1] * t;
+  }
+  return out;
+}
