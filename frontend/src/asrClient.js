@@ -38,6 +38,19 @@ export async function finishSession(sessionId) {
   return await r.json();
 }
 
+export async function transcribeUtterance(sessionId, float32_16k) {
+  const r = await fetch(
+    `${BASE}/transcribe?session_id=${encodeURIComponent(sessionId)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: float32_16k.buffer,
+    }
+  );
+  if (!r.ok) throw new Error(`transcribe failed: ${r.status} ${await r.text()}`);
+  return await r.json();
+}
+
 export async function chat(sessionId, text) {
   const r = await fetch(`${BASE}/chat`, {
     method: "POST",

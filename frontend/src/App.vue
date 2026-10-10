@@ -4,10 +4,12 @@ import {
   startSession,
   pushChunk,
   finishSession,
+  transcribeUtterance,
   chat,
   resampleLinear,
 } from "./asrClient.js";
 import { playTts, stopPlayback } from "./ttsPlayer.js";
+import { startVad, stopVad, releaseSharedStream } from "./vad.js";
 
 const TARGET_SR = 16000;
 const CHUNK_MS = 500;
@@ -25,6 +27,11 @@ const asrEl = ref(null);
 const autoPlay = ref(true); // auto-speak each assistant reply
 const ttsState = ref("idle"); // idle | synthesizing | playing | done
 const playingIndex = ref(-1); // which message is currently speaking
+const vadEnabled = ref(false); // hands-free Silero VAD (opt-in; headphones recommended)
+const vadProb = ref(0);
+const vadActive = ref(false);
+const vadSilenceMs = ref(0);
+const vadSegmentMs = ref(0);
 
 let audioCtx = null;
 let processor = null;
@@ -35,6 +42,7 @@ let running = false;
 let buf = new Float32Array(0);
 let pushing = false;
 let holdActive = false; // pointer/key currently held for push-to-talk
+let wantRecording = false; // unified record intent (button OR VAD)
 
 function setStatus(s, label) {
   status.value = s;
@@ -70,6 +78,15 @@ function stopSpeak() {
   ttsState.value = "idle";
 }
 
+// True only while the assistant is actively synthesizing/playing (not "done").
+function isSpeaking() {
+  return (
+    playingIndex.value !== -1 ||
+    ttsState.value === "playing" ||
+    ttsState.value === "synthesizing"
+  );
+}
+
 // Synthesize + stream-play one message's text.
 async function speak(index) {
   const msg = messages.value[index];
@@ -86,7 +103,10 @@ async function speak(index) {
     error.value = err.message;
     ttsState.value = "idle";
   } finally {
-    if (playingIndex.value === index) playingIndex.value = -1;
+    if (playingIndex.value === index) {
+      playingIndex.value = -1;
+      ttsState.value = "idle";
+    }
   }
 }
 
@@ -188,8 +208,8 @@ async function startRecording() {
     source.connect(processor);
     processor.connect(audioCtx.destination);
 
-    // The user may have released the button while getUserMedia was resolving.
-    if (!holdActive) {
+    // The user may have released the button while the stream was resolving.
+    if (!wantRecording) {
       await stopPipeline();
       return;
     }
@@ -210,6 +230,15 @@ async function stopRecording() {
   setStatus("finishing", "识别中…");
   await stopPipeline();
   try {
+    // Flush any tail audio left in the buffer (pump only sends full 500ms
+    // chunks, so the last partial chunk would otherwise be dropped).
+    while (pushing) await new Promise((r) => setTimeout(r, 50));
+    if (buf.length > 0) {
+      const j = await pushChunk(sessionId, buf);
+      language.value = j.language || "—";
+      asrText.value = j.text || "";
+      buf = new Float32Array(0);
+    }
     const j = await finishSession(sessionId);
     language.value = j.language || "—";
     asrText.value = j.text || "";
@@ -226,14 +255,94 @@ async function stopRecording() {
 
 // ---- Push-to-talk: press to start, release to finish ----
 function onHoldStart() {
+  if (vadEnabled.value) {
+    // In hands-free mode, VAD already owns the microphone continuously. Pressing
+    // the button is only used as an emergency barge-in to stop playback.
+    if (isSpeaking()) stopSpeak();
+    return;
+  }
   if (holdActive) return;
   holdActive = true;
+  wantRecording = true;
   startRecording();
 }
 function onHoldEnd() {
+  if (vadEnabled.value) return;
   if (!holdActive) return;
   holdActive = false;
+  wantRecording = false;
   stopRecording();
+}
+
+// ---- Hands-free VAD ----
+let vadSegmentActive = false;
+let vadProcessing = false;
+
+async function handleVadAudio(audio) {
+  if (vadProcessing || !audio?.length) return;
+  vadProcessing = true;
+  error.value = "";
+  setStatus("finishing", "识别中…");
+  try {
+    const sid = await ensureSession();
+    const j = await transcribeUtterance(sid, audio);
+    language.value = j.language || "—";
+    asrText.value = j.text || "";
+    setStatus("done", "已识别");
+    if (asrText.value.trim()) await sendToLLM(asrText.value);
+  } catch (err) {
+    error.value = err.message;
+    asrText.value = "识别失败：远程 ASR 服务异常。";
+    scrollAsr();
+    setStatus("error", "识别失败");
+  } finally {
+    vadProcessing = false;
+  }
+}
+
+async function onVadToggle() {
+  if (vadEnabled.value) {
+    try {
+      await startVad({
+        onSpeechStart: () => {
+          // In hands-free mode, VAD owns recording. We only update UI and stop
+          // playback if the user starts talking while assistant is speaking.
+          if (isSpeaking()) stopSpeak();
+          vadSegmentActive = true;
+          vadActive.value = true;
+          asrText.value = "";
+          language.value = "—";
+          setStatus("listening", "正在说话…");
+        },
+        onSpeechEnd: (audio) => {
+          if (!vadSegmentActive) return;
+          vadSegmentActive = false;
+          vadActive.value = false;
+          handleVadAudio(audio);
+        },
+        onFrame: (prob, active, silenceMs, segmentMs) => {
+          vadProb.value = prob;
+          vadActive.value = active;
+          vadSilenceMs.value = silenceMs || 0;
+          vadSegmentMs.value = segmentMs || 0;
+        },
+      });
+    } catch (err) {
+      error.value = "VAD 启动失败: " + err.message;
+      vadEnabled.value = false;
+      stopVad();
+      releaseSharedStream();
+    }
+  } else {
+    vadSegmentActive = false;
+    vadActive.value = false;
+    vadProb.value = 0;
+    vadSilenceMs.value = 0;
+    vadSegmentMs.value = 0;
+    stopVad();
+    releaseSharedStream();
+    if (!running) setStatus("idle", "未开始");
+  }
 }
 
 // Keyboard hold (Space) mirrors the button for desktop users.
@@ -267,6 +376,8 @@ onBeforeUnmount(() => {
   running = false;
   stopPipeline();
   stopPlayback();
+  stopVad();
+  releaseSharedStream();
 });
 </script>
 
@@ -297,8 +408,8 @@ onBeforeUnmount(() => {
           @pointercancel="onHoldEnd"
           @contextmenu.prevent
         >
-          <span class="ptt-icon">{{ running ? "🔴" : "🎙" }}</span>
-          <span class="ptt-label">{{ running ? "松开结束" : "按住说话" }}</span>
+          <span class="ptt-icon">{{ running ? "🔴" : vadEnabled ? "👂" : "🎙" }}</span>
+          <span class="ptt-label">{{ running ? "松开结束" : vadEnabled ? "正在监听" : "按住说话" }}</span>
         </button>
         <div class="asr-col">
           <textarea
@@ -310,7 +421,7 @@ onBeforeUnmount(() => {
             placeholder="实时识别内容会显示在这里…"
           ></textarea>
           <div class="hint">
-            按住说话，松开即识别并回复 · 播放中按住可打断 · 键盘长按 <kbd>空格</kbd>
+            {{ vadEnabled ? "免手持模式会持续监听麦克风，Mac 显示占用是正常的 · 说话自动识别，停顿后自动回复" : "按住说话，松开即识别并回复 · 播放中按住可打断 · 键盘长按空格" }}
           </div>
         </div>
       </div>
@@ -321,6 +432,14 @@ onBeforeUnmount(() => {
           <input type="checkbox" v-model="autoPlay" />
           自动朗读回复
         </label>
+        <label class="toggle" title="免手持：检测到说话自动开始录音，停顿自动结束。外放时 TTS 可能被误识别，建议戴耳机。">
+          <input type="checkbox" v-model="vadEnabled" @change="onVadToggle" />
+          免手持语音（Silero VAD）
+        </label>
+        <span v-if="vadEnabled" class="pill warn">建议戴耳机，避免外放回声误触发</span>
+        <span v-if="vadEnabled" class="pill" :class="vadActive ? 'listening' : ''">
+          VAD {{ vadActive ? "说话中" : "监听中" }} · p={{ vadProb.toFixed(2) }} · 静音{{ Math.round(vadSilenceMs) }}ms · 段{{ Math.round(vadSegmentMs) }}ms
+        </span>
       </div>
 
       <div class="panel chatpanel">

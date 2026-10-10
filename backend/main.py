@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import config
-from session import sessions
+from session import ASR_CHUNK_BYTES, sessions
 
 # Long read timeout: a chunk call blocks until the remote returns a transcript.
 client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
@@ -77,13 +77,11 @@ async def health() -> dict:
 # ---- session lifecycle ----
 @app.post("/api/session/start")
 async def session_start() -> JSONResponse:
+    # Only create the local app session here. Remote ASR sessions are started
+    # lazily when audio is actually sent; otherwise VAD/chat-only usage leaks
+    # idle remote ASR sessions and eventually makes the ASR service hang.
     s = sessions.create()
-    try:
-        await s.asr_start(client)
-    except httpx.HTTPError as e:
-        sessions.delete(s.id)
-        raise HTTPException(status_code=502, detail=f"ASR start failed: {e}")
-    return JSONResponse({"session_id": s.id, "asr_session_id": s.asr_session_id})
+    return JSONResponse({"session_id": s.id, "asr_session_id": None})
 
 
 def _get_session(session_id: str):
@@ -113,6 +111,41 @@ async def finish(session_id: str) -> JSONResponse:
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"ASR finish failed: {e}")
     return JSONResponse(j)
+
+
+@app.post("/api/transcribe")
+async def transcribe(request: Request, session_id: str) -> JSONResponse:
+    """Transcribe a complete utterance (float32 PCM 16k mono) without finish().
+
+    Silero VAD gives us a full speech segment. The remote ASR's /api/finish is
+    currently prone to hanging, so this path sends the whole segment as chunks
+    and returns the latest cumulative chunk result.
+    """
+    s = _get_session(session_id)
+    body = await request.body()
+    if not body:
+        return JSONResponse({"language": "", "text": ""})
+    try:
+        await s.asr_start(client)
+        # Remote ASR expects fixed 500ms little-endian float32 chunks.
+        result = {"language": "", "text": ""}
+        for off in range(0, len(body), ASR_CHUNK_BYTES):
+            chunk = body[off : off + ASR_CHUNK_BYTES]
+            if chunk:
+                result = await s.asr_chunk(client, chunk)
+        # Abandon the remote session instead of calling finish(), which can hang.
+        s.asr_session_id = None
+        return JSONResponse(result)
+    except httpx.HTTPStatusError as e:
+        s.asr_session_id = None
+        detail = e.response.text[:500] if e.response is not None else str(e)
+        raise HTTPException(
+            status_code=502,
+            detail=f"ASR transcribe failed: {e.response.status_code if e.response else ''} {detail}",
+        )
+    except httpx.HTTPError as e:
+        s.asr_session_id = None
+        raise HTTPException(status_code=502, detail=f"ASR transcribe failed: {type(e).__name__}: {e}")
 
 
 # ---- LLM chat ----
