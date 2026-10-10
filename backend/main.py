@@ -13,6 +13,8 @@ Frontend flow:
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +47,8 @@ async def _shutdown() -> None:
 TTS_SAMPLE_RATE = 24000
 # Reference audio (for voice cloning) loaded once into memory.
 TTS_REF_BYTES: bytes | None = None
+# Remote Breeze-TTS only supports one inference at a time.
+TTS_LOCK = asyncio.Lock()
 
 
 @app.on_event("startup")
@@ -149,6 +153,49 @@ async def transcribe(request: Request, session_id: str) -> JSONResponse:
 
 
 # ---- LLM chat ----
+class DecideReq(BaseModel):
+    session_id: str
+    text: str
+    source: str = "vad"
+
+
+@app.post("/api/decide")
+async def decide(req: DecideReq) -> JSONResponse:
+    s = _get_session(req.session_id)
+    should_reply, reason = s.should_reply(req.text, req.source)
+    return JSONResponse(
+        {
+            "should_reply": should_reply,
+            "reason": reason,
+            "active": s.is_active(),
+            "active_remaining": round(s.active_remaining(), 1),
+        }
+    )
+
+
+class TouchReq(BaseModel):
+    session_id: str
+    seconds: float | None = None
+    force: bool = False
+
+
+@app.post("/api/touch")
+async def touch(req: TouchReq) -> JSONResponse:
+    s = _get_session(req.session_id)
+    # Speech-start may only extend an already active session. TTS playback is
+    # allowed to force an extension because the assistant is already replying.
+    was_active = s.is_active()
+    if was_active or req.force:
+        s.activate(req.seconds)
+    return JSONResponse(
+        {
+            "active": s.is_active(),
+            "active_remaining": round(s.active_remaining(), 1),
+            "extended": was_active or req.force,
+        }
+    )
+
+
 class ChatReq(BaseModel):
     session_id: str
     text: str
@@ -161,7 +208,13 @@ async def chat(req: ChatReq) -> JSONResponse:
         reply = await s.chat(client, req.text)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
-    return JSONResponse({"reply": reply})
+    return JSONResponse(
+        {
+            "reply": reply,
+            "active": s.is_active(),
+            "active_remaining": round(s.active_remaining(), 1),
+        }
+    )
 
 
 # ---- TTS (streaming PCM) ----
@@ -187,21 +240,31 @@ async def tts(req: TtsReq) -> StreamingResponse:
         form["ref_text"] = config.TTS_REF_TEXT
         files = {"ref_audio": ("ref_voice.wav", TTS_REF_BYTES, "audio/wav")}
 
+    if TTS_LOCK.locked():
+        raise HTTPException(status_code=409, detail="TTS 正在合成上一条，请稍后再试")
+
+    await TTS_LOCK.acquire()
+    stream_cm = client.stream(
+        "POST",
+        f"{config.TTS_BASE_URL}/v1/audio/speech",
+        data=form,
+        files=files,
+        timeout=httpx.Timeout(120.0, connect=10.0),
+    )
+    upstream = await stream_cm.__aenter__()
+    if upstream.status_code != 200:
+        detail = (await upstream.aread()).decode(errors="replace")
+        await stream_cm.__aexit__(None, None, None)
+        TTS_LOCK.release()
+        raise HTTPException(status_code=502, detail=f"TTS failed: {upstream.status_code} {detail}")
+
     async def relay():
-        async with client.stream(
-            "POST",
-            f"{config.TTS_BASE_URL}/v1/audio/speech",
-            data=form,
-            files=files,
-            timeout=httpx.Timeout(120.0, connect=10.0),
-        ) as upstream:
-            if upstream.status_code != 200:
-                detail = (await upstream.aread()).decode(errors="replace")
-                raise HTTPException(
-                    status_code=502, detail=f"TTS failed: {upstream.status_code} {detail}"
-                )
+        try:
             async for chunk in upstream.aiter_raw():
                 yield chunk
+        finally:
+            await stream_cm.__aexit__(None, None, None)
+            TTS_LOCK.release()
 
     return StreamingResponse(
         relay(),

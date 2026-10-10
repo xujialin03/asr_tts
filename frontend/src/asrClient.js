@@ -51,6 +51,26 @@ export async function transcribeUtterance(sessionId, float32_16k) {
   return await r.json();
 }
 
+export async function decide(sessionId, text, source = "vad") {
+  const r = await fetch(`${BASE}/decide`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, text, source }),
+  });
+  if (!r.ok) throw new Error(`decide failed: ${r.status} ${await r.text()}`);
+  return await r.json();
+}
+
+export async function touchSession(sessionId, { seconds = null, force = false } = {}) {
+  const r = await fetch(`${BASE}/touch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, seconds, force }),
+  });
+  if (!r.ok) throw new Error(`touch failed: ${r.status} ${await r.text()}`);
+  return await r.json();
+}
+
 export async function chat(sessionId, text) {
   const r = await fetch(`${BASE}/chat`, {
     method: "POST",
@@ -58,7 +78,7 @@ export async function chat(sessionId, text) {
     body: JSON.stringify({ session_id: sessionId, text }),
   });
   if (!r.ok) throw new Error(`chat failed: ${r.status} ${await r.text()}`);
-  return (await r.json()).reply;
+  return await r.json();
 }
 
 // Linear resample a Float32Array from srcSr to dstSr.

@@ -39,6 +39,14 @@ LLM_API_KEY = _llm.get("api_key", "empty")
 LLM_TEMPERATURE = _llm.get("temperature", 0.7)
 LLM_ROLE_PROMPT = _llm.get("role_prompt", "")
 
+_assistant = _cfg.get("assistant", {})
+WAKE_WORDS = _assistant.get("wake_words", ["志玲", "志玲姐姐", "姐姐", "小助手"])
+ACTIVE_WINDOW_SECONDS = float(_assistant.get("active_window_seconds", 20))
+DIRECT_QUESTION_HINTS = _assistant.get(
+    "direct_question_hints",
+    ["你觉得", "帮我", "怎么办", "为什么", "能不能", "可以不可以", "陪我", "给我"],
+)
+
 _tts = _cfg.get("tts", {})
 TTS_PROMPT = _tts.get("prompt", "")
 TTS_REF_TEXT = _tts.get("ref_text", "")

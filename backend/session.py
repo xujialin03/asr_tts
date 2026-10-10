@@ -11,6 +11,7 @@ the frontend can keep one `session_id` across ASR and LLM calls.
 from __future__ import annotations
 
 import secrets
+import time
 from dataclasses import dataclass, field
 
 import httpx
@@ -42,6 +43,7 @@ class Session:
     last_asr: dict = field(default_factory=lambda: {"language": "", "text": ""})
     # Conversation history WITHOUT the system prompt (system is prepended per call).
     messages: list[dict] = field(default_factory=list)
+    active_until: float = 0.0
 
     # ---- ASR lifecycle (relayed to the remote ASR service) ----
     async def asr_start(self, client: httpx.AsyncClient) -> str:
@@ -100,6 +102,40 @@ class Session:
         self.asr_session_id = None
         return j
 
+    # ---- turn gate ----
+    def activate(self, seconds: float | None = None) -> None:
+        duration = config.ACTIVE_WINDOW_SECONDS if seconds is None else seconds
+        duration = max(1.0, min(float(duration), 300.0))
+        # Never shorten an already longer active window.
+        self.active_until = max(self.active_until, time.time() + duration)
+
+    def is_active(self) -> bool:
+        return time.time() <= self.active_until
+
+    def active_remaining(self) -> float:
+        return max(0.0, self.active_until - time.time())
+
+    def should_reply(self, text: str, source: str = "vad") -> tuple[bool, str]:
+        text = (text or "").strip()
+        if not text:
+            return False, "空识别结果"
+        if source == "push_to_talk":
+            self.activate()
+            return True, "手动按住说话"
+        if any(w and w in text for w in config.WAKE_WORDS):
+            self.activate()
+            return True, "命中唤醒词"
+        if time.time() <= self.active_until:
+            self.activate()
+            return True, "连续对话窗口内"
+        if any(h and h in text for h in config.DIRECT_QUESTION_HINTS):
+            self.activate()
+            return True, "明显指令或问题"
+        if text.endswith(("吗", "呢", "?", "？")):
+            self.activate()
+            return True, "问句"
+        return False, "未命中唤醒词且不在连续对话窗口"
+
     # ---- LLM turn ----
     async def chat(self, client: httpx.AsyncClient, user_text: str) -> str:
         """Append user_text, call the LLM with the role prompt, return the reply."""
@@ -125,6 +161,7 @@ class Session:
         r.raise_for_status()
         reply = r.json()["choices"][0]["message"]["content"]
         self.messages.append({"role": "assistant", "content": reply})
+        self.activate()
         return reply
 
 

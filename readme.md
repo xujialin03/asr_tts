@@ -1,3 +1,10 @@
+# 技术栈
+- 前端：Vue 3 + Vite
+- 后端：FastAPI + uv
+- 语音检测VAD: Silero VAD
+- 语音识别：Qwen3-ASR 流式识别服务
+- LLM：Qwen3.8-Flash-Next 
+- 语音合成：Breeze-TTS-2 流式合成服务
 
 # Qwen3-ASR 语音转文字
 

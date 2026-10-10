@@ -5,6 +5,8 @@ import {
   pushChunk,
   finishSession,
   transcribeUtterance,
+  decide,
+  touchSession,
   chat,
   resampleLinear,
 } from "./asrClient.js";
@@ -13,6 +15,7 @@ import { startVad, stopVad, releaseSharedStream } from "./vad.js";
 
 const TARGET_SR = 16000;
 const CHUNK_MS = 500;
+const POST_REPLY_ACTIVE_SECONDS = 20;
 
 const status = ref("idle"); // idle | listening | finishing | error | done
 const statusText = ref("未开始");
@@ -21,6 +24,9 @@ const asrText = ref(""); // live ASR recognition
 const messages = ref([]); // {role, content} conversation
 const sending = ref(false);
 const error = ref("");
+const gateNotice = ref("");
+const aiActive = ref(false);
+const activeRemaining = ref(0);
 const logEl = ref(null);
 const asrEl = ref(null);
 
@@ -47,6 +53,28 @@ let wantRecording = false; // unified record intent (button OR VAD)
 function setStatus(s, label) {
   status.value = s;
   statusText.value = label;
+}
+
+function updateActive(info) {
+  aiActive.value = !!info?.active;
+  activeRemaining.value = Number(info?.active_remaining || 0);
+}
+
+let lastPlaybackTouchAt = 0;
+let lastPlaybackExtension = 0;
+async function extendActiveForPlayback(remainingSeconds, force = false) {
+  if (!sessionId) return;
+  const extension = Math.ceil(remainingSeconds + POST_REPLY_ACTIVE_SECONDS);
+  const now = Date.now();
+  // TTS yields many small chunks. Only sync when the estimated deadline moves
+  // meaningfully, or at most once every two seconds.
+  if (!force && extension <= lastPlaybackExtension + 1 && now - lastPlaybackTouchAt < 2000) return;
+  lastPlaybackTouchAt = now;
+  lastPlaybackExtension = extension;
+  try {
+    const info = await touchSession(sessionId, { seconds: extension, force: true });
+    updateActive(info);
+  } catch (_) {}
 }
 
 function concatFloat32(a, b) {
@@ -93,16 +121,25 @@ async function speak(index) {
   if (!msg) return;
   stopPlayback();
   playingIndex.value = index;
+  lastPlaybackTouchAt = 0;
+  lastPlaybackExtension = 0;
+  // Keep the session active while synthesis is waiting for its first chunk.
+  extendActiveForPlayback(0, true);
   try {
     await playTts(msg.content, {
       onState: (s) => {
         ttsState.value = s;
+      },
+      onDuration: ({ remainingSeconds }) => {
+        extendActiveForPlayback(remainingSeconds);
       },
     });
   } catch (err) {
     error.value = err.message;
     ttsState.value = "idle";
   } finally {
+    // Start a fresh post-reply window from actual playback completion/cancel.
+    extendActiveForPlayback(0, true);
     if (playingIndex.value === index) {
       playingIndex.value = -1;
       ttsState.value = "idle";
@@ -115,6 +152,7 @@ async function sendToLLM(text) {
   const content = (text || "").trim();
   if (!content) return;
   error.value = "";
+  gateNotice.value = "";
   sending.value = true;
   messages.value.push({ role: "user", content });
   // Clear the live-recognition box once the text has been sent.
@@ -122,7 +160,9 @@ async function sendToLLM(text) {
   scrollLog();
   try {
     const sid = await ensureSession();
-    const reply = await chat(sid, content);
+    const result = await chat(sid, content);
+    const reply = result.reply;
+    updateActive(result);
     messages.value.push({ role: "assistant", content: reply });
     scrollLog();
     if (autoPlay.value) speak(messages.value.length - 1);
@@ -278,6 +318,14 @@ function onHoldEnd() {
 let vadSegmentActive = false;
 let vadProcessing = false;
 
+async function touchActiveWindow() {
+  try {
+    const sid = await ensureSession();
+    const info = await touchSession(sid);
+    updateActive(info);
+  } catch (_) {}
+}
+
 async function handleVadAudio(audio) {
   if (vadProcessing || !audio?.length) return;
   vadProcessing = true;
@@ -289,7 +337,17 @@ async function handleVadAudio(audio) {
     language.value = j.language || "—";
     asrText.value = j.text || "";
     setStatus("done", "已识别");
-    if (asrText.value.trim()) await sendToLLM(asrText.value);
+    const text = asrText.value.trim();
+    if (!text) return;
+    const decision = await decide(sid, text, "vad");
+    updateActive(decision);
+    if (decision.should_reply) {
+      gateNotice.value = "";
+      await sendToLLM(text);
+    } else {
+      setStatus("idle", "未触发回复");
+      gateNotice.value = decision.reason || "未触发回复";
+    }
   } catch (err) {
     error.value = err.message;
     asrText.value = "识别失败：远程 ASR 服务异常。";
@@ -310,6 +368,7 @@ async function onVadToggle() {
           if (isSpeaking()) stopSpeak();
           vadSegmentActive = true;
           vadActive.value = true;
+          touchActiveWindow();
           asrText.value = "";
           language.value = "—";
           setStatus("listening", "正在说话…");
@@ -364,15 +423,27 @@ function clearAll() {
   asrText.value = "";
   language.value = "—";
   error.value = "";
+  gateNotice.value = "";
+  aiActive.value = false;
+  activeRemaining.value = 0;
 }
+
+let activeTimer = null;
 
 onMounted(() => {
   window.addEventListener("keydown", onKey);
   window.addEventListener("keyup", onKey);
+  activeTimer = window.setInterval(() => {
+    if (activeRemaining.value > 0) {
+      activeRemaining.value = Math.max(0, activeRemaining.value - 1);
+      if (activeRemaining.value === 0) aiActive.value = false;
+    }
+  }, 1000);
 });
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
   window.removeEventListener("keyup", onKey);
+  if (activeTimer) window.clearInterval(activeTimer);
   running = false;
   stopPipeline();
   stopPlayback();
@@ -389,6 +460,9 @@ onBeforeUnmount(() => {
       <div class="row">
         <span class="pill" :class="status">{{ statusText }}</span>
         <span class="pill">语言: {{ language }}</span>
+        <span class="pill" :class="aiActive ? 'listening' : ''">
+          {{ aiActive ? `AI 已激活 · ${Math.round(activeRemaining)}s` : "AI 未激活" }}
+        </span>
         <span
           v-if="ttsState !== 'idle'"
           class="pill"
@@ -441,6 +515,8 @@ onBeforeUnmount(() => {
           VAD {{ vadActive ? "说话中" : "监听中" }} · p={{ vadProb.toFixed(2) }} · 静音{{ Math.round(vadSilenceMs) }}ms · 段{{ Math.round(vadSegmentMs) }}ms
         </span>
       </div>
+
+      <div v-if="gateNotice" class="notice">{{ gateNotice }}</div>
 
       <div class="panel chatpanel">
         <div class="label">对话</div>
@@ -708,6 +784,10 @@ button:disabled {
 }
 .err {
   color: #9f1239;
+  font-size: 13px;
+}
+.notice {
+  color: #64748b;
   font-size: 13px;
 }
 </style>
