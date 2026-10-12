@@ -6,6 +6,8 @@
 - LLM：Qwen3.8-Flash-Next 
 - 语音合成：Breeze-TTS-2 流式合成服务
 
+> 语音交互、会话激活和打断机制的详细设计见 [docs/voice-interaction-design.md](docs/voice-interaction-design.md)。
+
 # Qwen3-ASR 语音转文字
 
 把语音实时转成文字的 Web 应用。前端 Vue 采集/上传音频，后端 FastAPI 代理转发到远程 Qwen3-ASR 流式识别服务。
@@ -21,6 +23,7 @@
 ```
 backend/    FastAPI 代理（uv 管理）
 frontend/   Vue 3 + Vite 前端
+docs/       详细设计文档
 ```
 
 ## 远程 ASR 协议
