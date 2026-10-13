@@ -35,10 +35,18 @@ TTS_BASE_URL = _url(services["tts"])
 LLM_BASE_URL = _url(services["llm"])
 
 _llm = _cfg.get("llm", {})
+LLM_PROVIDER = _llm.get("provider", "openai")
 LLM_MODEL_ID = _llm.get("model_id", "")
 LLM_API_KEY = _llm.get("api_key", "empty")
 LLM_TEMPERATURE = _llm.get("temperature", 0.7)
 LLM_ROLE_PROMPT = _llm.get("role_prompt", "")
+LLM_FALLBACK_TO_OPENAI = bool(_llm.get("fallback_to_openai", True))
+
+_hermes = _llm.get("hermes", {})
+HERMES_CLIENT_PATH = os.path.expanduser(
+    _hermes.get("client_path", "~/worker_agent_client.py")
+)
+HERMES_TIMEOUT_SECONDS = float(_hermes.get("timeout_seconds", 180))
 
 _assistant = _cfg.get("assistant", {})
 WAKE_WORDS = _assistant.get("wake_words", ["志玲", "志玲姐姐", "姐姐", "小助手"])

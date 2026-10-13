@@ -30,9 +30,16 @@ assistant:
     - "打住"
 
 llm:
+  # openai: call services.llm as an OpenAI-compatible API.
+  # hermes: call the persistent local Hermes worker and optionally fall back.
+  provider: openai
   model_id: your-model-id
   api_key: empty
   temperature: 0.7
+  fallback_to_openai: true
+  hermes:
+    client_path: ~/worker_agent_client.py
+    timeout_seconds: 180
   role_prompt: |
     # Role: 你的角色设定
     在这里写系统提示词（人设、互动方式、语言风格）。

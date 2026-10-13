@@ -10,7 +10,9 @@ the frontend can keep one `session_id` across ASR and LLM calls.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -44,6 +46,7 @@ class Session:
     # Conversation history WITHOUT the system prompt (system is prepended per call).
     messages: list[dict] = field(default_factory=list)
     active_until: float = 0.0
+    chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     # ---- ASR lifecycle (relayed to the remote ASR service) ----
     async def asr_start(self, client: httpx.AsyncClient) -> str:
@@ -149,13 +152,8 @@ class Session:
         return False, "未命中唤醒词且不在连续对话窗口"
 
     # ---- LLM turn ----
-    async def chat(self, client: httpx.AsyncClient, user_text: str) -> str:
-        """Append user_text, call the LLM with the role prompt, return the reply."""
-        user_text = (user_text or "").strip()
-        if not user_text:
-            return ""
+    async def _chat_openai(self, client: httpx.AsyncClient, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
-
         payload = {
             "model": config.LLM_MODEL_ID,
             "temperature": config.LLM_TEMPERATURE,
@@ -165,16 +163,86 @@ class Session:
             ],
         }
         headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"}
-        r = await client.post(
-            f"{config.LLM_BASE_URL}/v1/chat/completions",
-            json=payload,
-            headers=headers,
-        )
-        r.raise_for_status()
-        reply = r.json()["choices"][0]["message"]["content"]
+        try:
+            r = await client.post(
+                f"{config.LLM_BASE_URL}/v1/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            r.raise_for_status()
+            reply = r.json()["choices"][0]["message"]["content"]
+        except Exception:
+            self.messages.pop()
+            raise
         self.messages.append({"role": "assistant", "content": reply})
-        self.activate()
         return reply
+
+    async def _chat_hermes(self, user_text: str) -> str:
+        prompt = user_text
+        # Hermes owns the persistent conversation, so inject the voice persona
+        # once when this backend session first starts using it.
+        if not self.messages and config.LLM_ROLE_PROMPT:
+            prompt = (
+                "请在后续持续遵守以下角色和输出要求。\n\n"
+                f"{config.LLM_ROLE_PROMPT}\n\n"
+                f"现在回复用户：{user_text}"
+            )
+
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            config.HERMES_CLIENT_PATH,
+            "ask",
+            prompt,
+            "--timeout",
+            str(config.HERMES_TIMEOUT_SECONDS),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=config.HERMES_TIMEOUT_SECONDS + 10,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            raise RuntimeError("Hermes client timed out")
+
+        if process.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()
+            raise RuntimeError(detail or f"Hermes client exited with {process.returncode}")
+        reply = stdout.decode(errors="replace").strip()
+        if not reply:
+            raise RuntimeError("Hermes returned an empty response")
+        self.messages.extend(
+            [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": reply},
+            ]
+        )
+        return reply
+
+    async def chat(self, client: httpx.AsyncClient, user_text: str) -> str:
+        """Send a turn to the configured LLM provider and return its reply."""
+        user_text = (user_text or "").strip()
+        if not user_text:
+            return ""
+
+        async with self.chat_lock:
+            if config.LLM_PROVIDER == "hermes":
+                try:
+                    reply = await self._chat_hermes(user_text)
+                except Exception:
+                    if not config.LLM_FALLBACK_TO_OPENAI:
+                        raise
+                    reply = await self._chat_openai(client, user_text)
+            elif config.LLM_PROVIDER == "openai":
+                reply = await self._chat_openai(client, user_text)
+            else:
+                raise RuntimeError(f"Unsupported LLM provider: {config.LLM_PROVIDER}")
+
+            self.activate()
+            return reply
 
 
 class SessionManager:

@@ -73,6 +73,7 @@ async def health() -> dict:
         "status": "ok",
         "asr": config.ASR_BASE_URL,
         "llm": config.LLM_BASE_URL,
+        "llm_provider": config.LLM_PROVIDER,
         "tts": config.TTS_BASE_URL,
         "model": config.LLM_MODEL_ID,
     }
@@ -223,7 +224,7 @@ async def chat(req: ChatReq) -> JSONResponse:
     s = _get_session(req.session_id)
     try:
         reply = await s.chat(client, req.text)
-    except httpx.HTTPError as e:
+    except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
     return JSONResponse(
         {
