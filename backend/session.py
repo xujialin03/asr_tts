@@ -115,6 +115,18 @@ class Session:
     def active_remaining(self) -> float:
         return max(0.0, self.active_until - time.time())
 
+    def match_interrupt(self, text: str) -> tuple[bool, str]:
+        """Return (matched, remaining_text_after_interrupt_phrase)."""
+        normalized = (text or "").strip()
+        for pattern in config.INTERRUPT_PATTERNS:
+            match = pattern.search(normalized)
+            if match:
+                remainder = (normalized[: match.start()] + normalized[match.end() :]).strip(
+                    " ，,。.!！?？、"
+                )
+                return True, remainder
+        return False, normalized
+
     def should_reply(self, text: str, source: str = "vad") -> tuple[bool, str]:
         text = (text or "").strip()
         if not text:

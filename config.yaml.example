@@ -11,6 +11,24 @@ services:
     host: 127.0.0.1
     port: 9090
 
+assistant:
+  wake_words:
+    - 志玲
+    - 志玲姐姐
+    - 志宁
+    - 姐姐
+    - 小助手
+  active_window_seconds: 20
+  # AI 播放时，只有 ASR 文本命中这些正则才触发打断。
+  interrupt_patterns:
+    - "等(?:一)?下"
+    - "慢着"
+    - "停(?:一)?下"
+    - "暂停(?:一下)?"
+    - "先别说(?:了)?"
+    - "别说(?:了)?"
+    - "打住"
+
 llm:
   model_id: your-model-id
   api_key: empty

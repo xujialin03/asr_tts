@@ -131,29 +131,57 @@ AI 已激活 · 32s
 
 ## 5. 打断（Barge-in）逻辑
 
-### 5.1 触发入口
+### 5.1 两阶段文本确认式打断
 
-当前支持三种打断：
+为降低咳嗽、耳麦摩擦和旁人说话造成的误打断，VAD 检测到人声时不再立即停止 TTS。流程为：
 
-1. VAD 检测到用户开始说话；
-2. 用户在播放时按下 Push-to-talk 按钮；
-3. 用户按 `Esc`。
+```text
+AI 正在合成/播放
+  ↓
+VAD 检测到人声（继续播放，不立即打断）
+  ↓
+VAD 收集完整 utterance
+  ↓
+ASR 转写
+  ↓
+正则匹配 interrupt_patterns
+  ├─ 未命中：视为环境干扰，不停止、不回复
+  ├─ 命中且无剩余文本：停止 TTS，不调用 LLM
+  └─ 命中且有剩余文本：停止 TTS，将剩余文本发给 LLM
+```
 
-VAD 自动打断位于 `frontend/src/App.vue` 的 `onVadToggle`：
+示例：
 
-```js
-onSpeechStart: () => {
-  if (isSpeaking()) stopSpeak()
+```text
+“等一下”                     → 只停止播放
+“慢着，我想问厦门天气”       → 停止播放，并把“我想问厦门天气”发给 LLM
+“旁边的人在聊天”             → 未命中打断词，继续播放且不回复
+```
+
+打断正则在 `config.yaml` 的 `assistant.interrupt_patterns` 配置。默认包括：
+
+- 等一下、等下、等一等、等会儿、稍等一下
+- 停一下、停一停、暂停一下、先停一下
+- 慢着、慢一点
+- 先别说了、别说了、不要说了
+- 打住、闭嘴
+
+后端 `Session.match_interrupt` 负责正则匹配和移除打断短语；`POST /api/decide` 根据 `assistant_speaking` 返回：
+
+```json
+{
+  "interrupt": true,
+  "should_reply": false,
+  "reply_text": "",
+  "reason": "命中纯打断指令"
 }
 ```
 
-`isSpeaking` 在以下状态返回 true：
+### 5.2 手动打断
 
-- TTS 正在合成；
-- TTS 正在播放；
-- 某条 assistant 消息仍标记为正在播放。
+用户在免手持模式中按下 Push-to-talk 按钮，或按 `Esc`，属于明确操作，仍然立即调用 `stopSpeak`，不经过文本匹配。
 
-### 5.2 统一停止入口
+### 5.3 统一停止入口
 
 所有打断最终调用：
 
@@ -166,7 +194,7 @@ stopSpeak()
 
 关键实现：`frontend/src/App.vue` 的 `stopSpeak`。
 
-### 5.3 HTTP 流取消传播
+### 5.4 HTTP 流取消传播
 
 仅停止 WebAudio 不足以中止 TTS 推理。`frontend/src/ttsPlayer.js` 的 `stopPlayback` 同时执行：
 
@@ -193,11 +221,11 @@ Breeze-TTS-2 _InferenceStreamingResponse 检测断开
 关闭模型生成器并释放 _request_lock
 ```
 
-### 5.4 误打断风险
+### 5.5 延迟与误判权衡
 
-当前实现偏向低延迟：Silero 初步判断 speech start 后立即打断。因此清嗓子、咳嗽、耳麦摩擦可能误触发。
+文本确认式打断需要等 VAD 切段和 ASR 转写后才停止 TTS，因此比“检测到声音立即停止”有更高延迟。收益是能过滤咳嗽、耳麦摩擦、旁人对话等干扰。
 
-若误打断明显，可改为确认人声持续 250～400ms 后再调用 `stopSpeak`。代价是打断延迟增加约 250～400ms。
+如后续需要更低延迟，可采用两级策略：持续人声达到 250～400ms 时先降低 TTS 音量，ASR 文本命中打断词后再完全停止；未命中则恢复音量。
 
 ## 6. TTS 流式播放与并发
 

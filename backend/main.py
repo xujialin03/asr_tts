@@ -157,15 +157,32 @@ class DecideReq(BaseModel):
     session_id: str
     text: str
     source: str = "vad"
+    assistant_speaking: bool = False
 
 
 @app.post("/api/decide")
 async def decide(req: DecideReq) -> JSONResponse:
     s = _get_session(req.session_id)
-    should_reply, reason = s.should_reply(req.text, req.source)
+    interrupt = False
+    reply_text = req.text.strip()
+
+    if req.assistant_speaking:
+        interrupt, reply_text = s.match_interrupt(req.text)
+        if not interrupt:
+            should_reply, reason = False, "播放期间未命中打断词，视为环境干扰"
+        elif reply_text:
+            s.activate()
+            should_reply, reason = True, "命中打断词并包含后续问题"
+        else:
+            should_reply, reason = False, "命中纯打断指令"
+    else:
+        should_reply, reason = s.should_reply(req.text, req.source)
+
     return JSONResponse(
         {
             "should_reply": should_reply,
+            "interrupt": interrupt,
+            "reply_text": reply_text,
             "reason": reason,
             "active": s.is_active(),
             "active_remaining": round(s.active_remaining(), 1),

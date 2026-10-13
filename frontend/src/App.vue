@@ -317,6 +317,7 @@ function onHoldEnd() {
 // ---- Hands-free VAD ----
 let vadSegmentActive = false;
 let vadProcessing = false;
+let vadCapturedDuringPlayback = false;
 
 async function touchActiveWindow() {
   try {
@@ -328,6 +329,8 @@ async function touchActiveWindow() {
 
 async function handleVadAudio(audio) {
   if (vadProcessing || !audio?.length) return;
+  const capturedDuringPlayback = vadCapturedDuringPlayback;
+  vadCapturedDuringPlayback = false;
   vadProcessing = true;
   error.value = "";
   setStatus("finishing", "识别中…");
@@ -339,13 +342,14 @@ async function handleVadAudio(audio) {
     setStatus("done", "已识别");
     const text = asrText.value.trim();
     if (!text) return;
-    const decision = await decide(sid, text, "vad");
+    const decision = await decide(sid, text, "vad", capturedDuringPlayback);
     updateActive(decision);
+    if (decision.interrupt) stopSpeak();
     if (decision.should_reply) {
-      gateNotice.value = "";
-      await sendToLLM(text);
+      gateNotice.value = decision.reason || "";
+      await sendToLLM(decision.reply_text || text);
     } else {
-      setStatus("idle", "未触发回复");
+      setStatus("idle", decision.interrupt ? "已打断" : "未触发回复");
       gateNotice.value = decision.reason || "未触发回复";
     }
   } catch (err) {
@@ -363,12 +367,13 @@ async function onVadToggle() {
     try {
       await startVad({
         onSpeechStart: () => {
-          // In hands-free mode, VAD owns recording. We only update UI and stop
-          // playback if the user starts talking while assistant is speaking.
-          if (isSpeaking()) stopSpeak();
+          // During playback, do not stop immediately. Record the full utterance,
+          // transcribe it, then only interrupt if text matches an interrupt pattern.
+          const duringPlayback = isSpeaking();
+          vadCapturedDuringPlayback = duringPlayback;
           vadSegmentActive = true;
           vadActive.value = true;
-          touchActiveWindow();
+          if (!duringPlayback) touchActiveWindow();
           asrText.value = "";
           language.value = "—";
           setStatus("listening", "正在说话…");

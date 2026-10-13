@@ -51,11 +51,16 @@ export async function transcribeUtterance(sessionId, float32_16k) {
   return await r.json();
 }
 
-export async function decide(sessionId, text, source = "vad") {
+export async function decide(sessionId, text, source = "vad", assistantSpeaking = false) {
   const r = await fetch(`${BASE}/decide`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, text, source }),
+    body: JSON.stringify({
+      session_id: sessionId,
+      text,
+      source,
+      assistant_speaking: assistantSpeaking,
+    }),
   });
   if (!r.ok) throw new Error(`decide failed: ${r.status} ${await r.text()}`);
   return await r.json();

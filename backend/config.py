@@ -7,6 +7,7 @@ service addresses plus the LLM role prompt and TTS voice prompt.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import yaml
@@ -46,6 +47,24 @@ DIRECT_QUESTION_HINTS = _assistant.get(
     "direct_question_hints",
     ["你觉得", "帮我", "怎么办", "为什么", "能不能", "可以不可以", "陪我", "给我"],
 )
+INTERRUPT_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in _assistant.get(
+        "interrupt_patterns",
+        [
+            r"等(?:一)?下",
+            r"等一等",
+            r"等会(?:儿)?",
+            r"稍等(?:一下)?",
+            r"停(?:一)?下",
+            r"暂停(?:一下)?",
+            r"慢着",
+            r"先别说(?:了)?",
+            r"别说(?:了)?",
+            r"打住",
+        ],
+    )
+]
 
 _tts = _cfg.get("tts", {})
 TTS_PROMPT = _tts.get("prompt", "")
