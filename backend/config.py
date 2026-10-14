@@ -33,6 +33,13 @@ services = _cfg.get("services", {})
 ASR_BASE_URL = _url(services["asr"])
 TTS_BASE_URL = _url(services["tts"])
 
+_postgresql = _cfg.get("database", {}).get("postgresql", {})
+POSTGRES_HOST = _postgresql.get("host", "127.0.0.1")
+POSTGRES_PORT = int(_postgresql.get("port", 5432))
+POSTGRES_DATABASE = _postgresql.get("database", "qwen3_asr")
+POSTGRES_USER = _postgresql.get("user", "qwen3_asr")
+POSTGRES_PASSWORD = _postgresql.get("password", "")
+
 _hermes = _cfg.get("hermes", {})
 HERMES_CLIENT_PATH = os.path.expanduser(
     _hermes.get("client_path", "~/worker_agent_client.py")

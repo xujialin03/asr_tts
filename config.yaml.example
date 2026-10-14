@@ -8,6 +8,15 @@ services:
     host: 127.0.0.1
     port: 7860
 
+# PostgreSQL used by project-owned agent modules (for example, voice profiles).
+database:
+  postgresql:
+    host: 127.0.0.1
+    port: 5432
+    database: qwen3_asr
+    user: qwen3_asr
+    password: change-me
+
 assistant:
   wake_words:
     - 志玲
