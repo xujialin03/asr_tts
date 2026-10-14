@@ -1,0 +1,23 @@
+services:
+  voiceprint:
+    build:
+      context: ./voiceprint-service
+    container_name: qwen3-voiceprint
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8002:8001"
+    environment:
+      VOICEPRINT_DATABASE_URL: ${VOICEPRINT_DATABASE_URL:-postgresql://qwen3_asr:change-me@host.docker.internal:5432/qwen3_asr}
+      VOICEPRINT_MODEL_ID: iic/speech_campplus_sv_zh-cn_16k-common
+      VOICEPRINT_MODEL_REVISION: v1.0.0
+      VOICEPRINT_MODEL_DIR: /models
+      VOICEPRINT_DEVICE: cpu
+      VOICEPRINT_IDENTIFY_THRESHOLD: ${VOICEPRINT_IDENTIFY_THRESHOLD:-0.55}
+      VOICEPRINT_UNCERTAIN_THRESHOLD: ${VOICEPRINT_UNCERTAIN_THRESHOLD:-0.45}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - voiceprint_models:/models
+
+volumes:
+  voiceprint_models:

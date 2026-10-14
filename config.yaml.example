@@ -7,6 +7,10 @@ services:
     name: breeze-tts-2
     host: 127.0.0.1
     port: 7860
+  voiceprint:
+    name: campplus
+    host: 127.0.0.1
+    port: 8002
 
 # PostgreSQL used by project-owned agent modules (for example, voice profiles).
 database:

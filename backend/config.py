@@ -32,6 +32,8 @@ def _url(svc: dict) -> str:
 services = _cfg.get("services", {})
 ASR_BASE_URL = _url(services["asr"])
 TTS_BASE_URL = _url(services["tts"])
+_voiceprint_service = services.get("voiceprint", {"host": "127.0.0.1", "port": 8002})
+VOICEPRINT_BASE_URL = _url(_voiceprint_service)
 
 _postgresql = _cfg.get("database", {}).get("postgresql", {})
 POSTGRES_HOST = _postgresql.get("host", "127.0.0.1")
