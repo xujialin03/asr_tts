@@ -1,7 +1,7 @@
 """Load service config from the repo-root config.yaml.
 
-config.yaml lives one level above the backend package. It holds the ASR/TTS/LLM
-service addresses plus the LLM role prompt and TTS voice prompt.
+config.yaml lives one level above the backend package. It holds the ASR/TTS
+service addresses, Hermes client settings, and TTS voice prompt.
 """
 
 from __future__ import annotations
@@ -32,17 +32,8 @@ def _url(svc: dict) -> str:
 services = _cfg.get("services", {})
 ASR_BASE_URL = _url(services["asr"])
 TTS_BASE_URL = _url(services["tts"])
-LLM_BASE_URL = _url(services["llm"])
 
-_llm = _cfg.get("llm", {})
-LLM_PROVIDER = _llm.get("provider", "openai")
-LLM_MODEL_ID = _llm.get("model_id", "")
-LLM_API_KEY = _llm.get("api_key", "empty")
-LLM_TEMPERATURE = _llm.get("temperature", 0.7)
-LLM_ROLE_PROMPT = _llm.get("role_prompt", "")
-LLM_FALLBACK_TO_OPENAI = bool(_llm.get("fallback_to_openai", True))
-
-_hermes = _llm.get("hermes", {})
+_hermes = _cfg.get("hermes", {})
 HERMES_CLIENT_PATH = os.path.expanduser(
     _hermes.get("client_path", "~/worker_agent_client.py")
 )
@@ -51,10 +42,6 @@ HERMES_TIMEOUT_SECONDS = float(_hermes.get("timeout_seconds", 180))
 _assistant = _cfg.get("assistant", {})
 WAKE_WORDS = _assistant.get("wake_words", ["志玲", "志玲姐姐", "姐姐", "小助手"])
 ACTIVE_WINDOW_SECONDS = float(_assistant.get("active_window_seconds", 20))
-DIRECT_QUESTION_HINTS = _assistant.get(
-    "direct_question_hints",
-    ["你觉得", "帮我", "怎么办", "为什么", "能不能", "可以不可以", "陪我", "给我"],
-)
 INTERRUPT_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in _assistant.get(

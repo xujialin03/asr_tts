@@ -7,9 +7,6 @@ services:
     name: breeze-tts-2
     host: 127.0.0.1
     port: 7860
-  llm:
-    host: 127.0.0.1
-    port: 9090
 
 assistant:
   wake_words:
@@ -29,20 +26,11 @@ assistant:
     - "别说(?:了)?"
     - "打住"
 
-llm:
-  # openai: call services.llm as an OpenAI-compatible API.
-  # hermes: call the persistent local Hermes worker and optionally fall back.
-  provider: openai
-  model_id: your-model-id
-  api_key: empty
-  temperature: 0.7
-  fallback_to_openai: true
-  hermes:
-    client_path: ~/worker_agent_client.py
-    timeout_seconds: 180
-  role_prompt: |
-    # Role: 你的角色设定
-    在这里写系统提示词（人设、互动方式、语言风格）。
+hermes:
+  # Client for the dedicated Hermes agent. Hermes owns conversation history
+  # and persona; the backend sends only the current user utterance.
+  client_path: ~/worker_agent_client.py
+  timeout_seconds: 180
 
 tts:
   prompt: "音色/语气提示词"

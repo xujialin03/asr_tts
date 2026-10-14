@@ -56,6 +56,8 @@ export async function playTts(text, { onState, onDuration } = {}) {
       signal: handle.abort.signal,
     });
     if (!res.ok) throw new Error(`tts failed: ${res.status} ${await res.text()}`);
+    const requestId = res.headers.get("X-TTS-Request-ID") || "?";
+    console.info(`[TTS #${requestId}] response accepted`);
 
     const sampleRate = parseInt(res.headers.get("X-Sample-Rate") || "24000", 10);
     const reader = res.body.getReader();

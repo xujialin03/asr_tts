@@ -3,7 +3,7 @@
 - 后端：FastAPI + uv
 - 语音检测VAD: Silero VAD
 - 语音识别：Qwen3-ASR 流式识别服务
-- LLM：Qwen3.8-Flash-Next 
+- 对话 Agent：项目专用 Hermes agent（由 Hermes 管理人设和对话历史）
 - 语音合成：Breeze-TTS-2 流式合成服务
 
 > 语音交互、会话激活和打断机制的详细设计见 [docs/voice-interaction-design.md](docs/voice-interaction-design.md)。

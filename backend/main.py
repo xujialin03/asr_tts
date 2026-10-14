@@ -1,19 +1,23 @@
 """Backend for the voice-chat pipeline.
 
-Relays the remote Qwen3-ASR streaming service and the OpenAI-compatible LLM,
-keeping per-session state (ASR session id + conversation history) in `session.py`.
+Relays the remote Qwen3-ASR and Breeze-TTS services and sends assistant turns
+to the dedicated Hermes agent. Local sessions keep only ASR and interaction
+state; Hermes owns the assistant conversation history.
 
 Frontend flow:
-  POST /api/session/start   -> create session + start ASR  -> {session_id}
-  POST /api/chunk           -> stream float32 PCM to ASR    -> {language, text}
-  POST /api/finish          -> finish ASR                   -> {language, text}
-  POST /api/chat            -> send text to LLM (role prompt)-> {reply}
+  POST /api/session/start   -> create local interaction session -> {session_id}
+  POST /api/chunk           -> stream float32 PCM to ASR        -> {language, text}
+  POST /api/finish          -> finish ASR                       -> {language, text}
+  POST /api/chat            -> send text to Hermes              -> {reply}
   POST /api/tts             -> synthesize speech (streaming PCM)
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
+import logging
+import time
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -49,6 +53,8 @@ TTS_SAMPLE_RATE = 24000
 TTS_REF_BYTES: bytes | None = None
 # Remote Breeze-TTS only supports one inference at a time.
 TTS_LOCK = asyncio.Lock()
+TTS_REQUEST_IDS = itertools.count(1)
+logger = logging.getLogger("uvicorn.error")
 
 
 @app.on_event("startup")
@@ -72,10 +78,8 @@ async def health() -> dict:
     return {
         "status": "ok",
         "asr": config.ASR_BASE_URL,
-        "llm": config.LLM_BASE_URL,
-        "llm_provider": config.LLM_PROVIDER,
+        "assistant": "hermes",
         "tts": config.TTS_BASE_URL,
-        "model": config.LLM_MODEL_ID,
     }
 
 
@@ -153,7 +157,7 @@ async def transcribe(request: Request, session_id: str) -> JSONResponse:
         raise HTTPException(status_code=502, detail=f"ASR transcribe failed: {type(e).__name__}: {e}")
 
 
-# ---- LLM chat ----
+# ---- Hermes chat ----
 class DecideReq(BaseModel):
     session_id: str
     text: str
@@ -223,9 +227,9 @@ class ChatReq(BaseModel):
 async def chat(req: ChatReq) -> JSONResponse:
     s = _get_session(req.session_id)
     try:
-        reply = await s.chat(client, req.text)
+        reply = await s.chat(req.text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Hermes call failed: {e}")
     return JSONResponse(
         {
             "reply": reply,
@@ -243,8 +247,19 @@ class TtsReq(BaseModel):
 @app.post("/api/tts")
 async def tts(req: TtsReq) -> StreamingResponse:
     """Relay the remote TTS service's streaming PCM (16-bit mono @ sample_rate)."""
+    request_id = next(TTS_REQUEST_IDS)
+    started_at = time.monotonic()
     text = (req.text or "").strip()
+    text_preview = text.replace("\n", " ")[:80]
+    logger.info(
+        "TTS request #%s received chars=%s text=%r locked=%s",
+        request_id,
+        len(text),
+        text_preview,
+        TTS_LOCK.locked(),
+    )
     if not text:
+        logger.warning("TTS request #%s rejected: empty text", request_id)
         raise HTTPException(status_code=400, detail="text required")
 
     form = {"text": text}
@@ -259,9 +274,14 @@ async def tts(req: TtsReq) -> StreamingResponse:
         files = {"ref_audio": ("ref_voice.wav", TTS_REF_BYTES, "audio/wav")}
 
     if TTS_LOCK.locked():
+        logger.warning(
+            "TTS request #%s rejected: previous request still holds lock",
+            request_id,
+        )
         raise HTTPException(status_code=409, detail="TTS 正在合成上一条，请稍后再试")
 
     await TTS_LOCK.acquire()
+    logger.info("TTS request #%s acquired lock", request_id)
     stream_cm = client.stream(
         "POST",
         f"{config.TTS_BASE_URL}/v1/audio/speech",
@@ -269,25 +289,75 @@ async def tts(req: TtsReq) -> StreamingResponse:
         files=files,
         timeout=httpx.Timeout(120.0, connect=10.0),
     )
-    upstream = await stream_cm.__aenter__()
-    if upstream.status_code != 200:
-        detail = (await upstream.aread()).decode(errors="replace")
-        await stream_cm.__aexit__(None, None, None)
+    upstream = None
+    try:
+        upstream = await stream_cm.__aenter__()
+        logger.info(
+            "TTS request #%s upstream status=%s content_type=%s",
+            request_id,
+            upstream.status_code,
+            upstream.headers.get("content-type", ""),
+        )
+        if upstream.status_code != 200:
+            detail = (await upstream.aread()).decode(errors="replace")
+            logger.error(
+                "TTS request #%s upstream failed status=%s detail=%s",
+                request_id,
+                upstream.status_code,
+                detail[:500],
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"TTS failed: {upstream.status_code} {detail}",
+            )
+    except BaseException as exc:
+        if upstream is not None:
+            await stream_cm.__aexit__(type(exc), exc, exc.__traceback__)
         TTS_LOCK.release()
-        raise HTTPException(status_code=502, detail=f"TTS failed: {upstream.status_code} {detail}")
+        logger.exception(
+            "TTS request #%s failed before streaming after %.2fs; lock released",
+            request_id,
+            time.monotonic() - started_at,
+        )
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=502,
+            detail=f"TTS upstream connection failed: {type(exc).__name__}: {exc}",
+        ) from exc
 
     async def relay():
+        total_bytes = 0
         try:
             async for chunk in upstream.aiter_raw():
+                total_bytes += len(chunk)
                 yield chunk
+            logger.info(
+                "TTS request #%s stream completed bytes=%s elapsed=%.2fs",
+                request_id,
+                total_bytes,
+                time.monotonic() - started_at,
+            )
+        except BaseException:
+            logger.exception(
+                "TTS request #%s stream interrupted bytes=%s elapsed=%.2fs",
+                request_id,
+                total_bytes,
+                time.monotonic() - started_at,
+            )
+            raise
         finally:
             await stream_cm.__aexit__(None, None, None)
             TTS_LOCK.release()
+            logger.info("TTS request #%s lock released", request_id)
 
     return StreamingResponse(
         relay(),
         media_type="audio/pcm",
-        headers={"X-Sample-Rate": str(TTS_SAMPLE_RATE)},
+        headers={
+            "X-Sample-Rate": str(TTS_SAMPLE_RATE),
+            "X-TTS-Request-ID": str(request_id),
+        },
     )
 
 

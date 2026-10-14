@@ -1,6 +1,6 @@
 # 语音交互详细设计
 
-本文记录语音助手的交互架构、状态机和关键实现约束。README 只保留项目介绍与运行方法；涉及 VAD、ASR、会话激活、打断、LLM、TTS 的设计决策统一维护在本文。
+本文记录语音助手的交互架构、状态机和关键实现约束。README 只保留项目介绍与运行方法；涉及 VAD、ASR、会话激活、打断、Hermes agent、TTS 的设计决策统一维护在本文。
 
 ## 1. 总体链路
 
@@ -12,15 +12,15 @@ Silero VAD（免手持模式）或 Push-to-talk（手动模式）
 Qwen3-ASR
   ↓
 唤醒词 / 连续对话门控
-  ├─ 未触发：只显示识别文本，不调用 LLM
-  └─ 已触发：Qwen LLM
+  ├─ 未触发：只显示识别文本，不调用 Hermes
+  └─ 已触发：项目专用 Hermes agent
                 ↓
              Breeze-TTS-2
                 ↓
              Web Audio 流式播放
 ```
 
-前端负责麦克风、VAD、播放和用户交互；FastAPI 后端负责 Session、门控状态、远程服务代理和对话历史。
+前端负责麦克风、VAD、播放和用户交互；FastAPI 后端负责本地 Session、门控状态和远程服务代理。项目专用 Hermes agent 独占管理助理人设、对话上下文和历史，backend 不保存或同步对话历史。
 
 ## 2. 输入模式
 
@@ -62,7 +62,7 @@ VAD 在 `onSpeechEnd(audio)` 产生完整 16kHz float32 PCM 片段，前端将�
 
 ## 3. 唤醒词与连续对话
 
-免手持模式识别到环境人声后，不应直接调用 LLM。文本先经过门控：
+免手持模式识别到环境人声后，不应直接调用 Hermes。文本先经过门控；冷启动时必须明确命中唤醒词，普通问句和指令不会自行激活：
 
 ```text
 ASR 文本
@@ -70,8 +70,6 @@ ASR 文本
 是否命中唤醒词？ ──是→ 激活并回复
   ↓ 否
 是否在活跃窗口内？ ──是→ 续期并回复
-  ↓ 否
-是否为明显问题/指令？ ──是→ 激活并回复
   ↓ 否
 静默丢弃，只显示识别文本
 ```
@@ -273,13 +271,15 @@ Breeze-TTS-2 的参考音频要求：
 
 ## 8. Session 管理
 
-后端每个 Session 保存：
+后端每个 Session 只保存：
 
 - 本地 session id；
 - 当前远程 ASR session id；
 - 最近一次 ASR 累计结果；
-- LLM user/assistant 历史；
-- `active_until`。
+- `active_until`；
+- 当前 Session 的 Hermes 调用锁。
+
+助理的人设、对话上下文和历史由项目专用 Hermes agent 持久管理，不属于 backend Session。
 
 Session 当前存放在进程内存中：
 
@@ -295,8 +295,8 @@ Session 当前存放在进程内存中：
 2. 浏览器麦克风要求 localhost 或 HTTPS。
 3. Breeze-TTS-2 单并发，短时间内可能出现 409；持续 409 通常表示服务端版本旧或资源未释放。
 4. 当前门控主要依赖 ASR 文本、唤醒词和 Session 状态，不是声学 KWS。
-5. 环境语音仍会被 ASR 转写，但未触发门控时不会发给 LLM。
-6. Session 尚未持久化。
+5. 环境语音仍会被 ASR 转写，但未触发门控时不会发给 Hermes agent。
+6. backend Session 尚未持久化；Hermes agent 的对话历史不受 backend Session 生命周期影响。
 
 ## 10. 修改本文的时机
 
