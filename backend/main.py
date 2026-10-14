@@ -186,6 +186,17 @@ async def resolve_voiceprint(request: Request, session_id: str) -> JSONResponse:
             detail=f"voiceprint resolve failed: {type(exc).__name__}: {exc}",
         ) from exc
     s.speaker_id = result["speaker_id"]
+    speaker = result.get("speaker") or {}
+    s.speaker_display_name = speaker.get("display_name")
+    s.speaker_preferred_name = speaker.get("preferred_name")
+    s.speaker_identity_named = bool(
+        s.speaker_preferred_name
+        or (
+            s.speaker_display_name
+            and not s.speaker_display_name.startswith("访客 ")
+        )
+    )
+    result["identity_named"] = s.speaker_identity_named
     result["audio_ref"] = s.store_voice_audio(body)
     return JSONResponse(result)
 
@@ -239,9 +250,15 @@ async def update_voiceprint_user(speaker_id: str, req: VoiceprintUserUpdate) -> 
     changes = req.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(status_code=400, detail="no fields to update")
-    return JSONResponse(
-        await _voiceprint_request("PATCH", f"/v1/users/{speaker_id}", json_body=changes)
+    result = await _voiceprint_request(
+        "PATCH", f"/v1/users/{speaker_id}", json_body=changes
     )
+    sessions.update_speaker_profile(
+        speaker_id,
+        result.get("display_name"),
+        result.get("preferred_name"),
+    )
+    return JSONResponse(result)
 
 
 @app.delete(

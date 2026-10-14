@@ -45,6 +45,10 @@ class Session:
     last_asr: dict = field(default_factory=lambda: {"language": "", "text": ""})
     active_until: float = 0.0
     speaker_id: str | None = None
+    speaker_display_name: str | None = None
+    speaker_preferred_name: str | None = None
+    speaker_identity_named: bool = False
+    wake_event: bool = False
     audio_ref: str | None = None
     audio_ref_expires_at: float = 0.0
     voice_audio: bytes | None = field(default=None, repr=False)
@@ -160,10 +164,13 @@ class Session:
         if source == "push_to_talk":
             self.activate()
             return True, "手动按住说话"
+        was_active = self.is_active()
         if kws_detected:
+            self.wake_event = not was_active
             self.activate()
             return True, f"声学唤醒词命中：{kws_keyword or '已配置关键词'}"
         if any(w and w in text for w in config.WAKE_WORDS):
+            self.wake_event = not was_active
             self.activate()
             return True, "命中精确文本唤醒词"
         if time.time() <= self.active_until:
@@ -176,6 +183,10 @@ class Session:
         context = {
             "speaker_id": self.speaker_id,
             "audio_ref": self.audio_ref,
+            "wake_event": self.wake_event,
+            "identity_named": self.speaker_identity_named,
+            "display_name": self.speaker_display_name,
+            "preferred_name": self.speaker_preferred_name,
         }
         hermes_message = (
             "[VOICE_CONTEXT]"
@@ -223,6 +234,7 @@ class Session:
 
         async with self.chat_lock:
             reply = await self._chat_hermes(user_text)
+            self.wake_event = False
             self.activate()
             return reply
 
@@ -252,6 +264,21 @@ class SessionManager:
                 if audio is not None:
                     return audio
         return None
+
+    def update_speaker_profile(
+        self,
+        speaker_id: str,
+        display_name: str | None,
+        preferred_name: str | None,
+    ) -> None:
+        identity_named = bool(
+            preferred_name or (display_name and not display_name.startswith("访客 "))
+        )
+        for session in self._store.values():
+            if session.speaker_id == speaker_id:
+                session.speaker_display_name = display_name
+                session.speaker_preferred_name = preferred_name
+                session.speaker_identity_named = identity_named
 
     def delete(self, sid: str) -> bool:
         return self._store.pop(sid, None) is not None

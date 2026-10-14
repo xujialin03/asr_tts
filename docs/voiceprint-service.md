@@ -114,6 +114,31 @@ python3 backend/voiceprintctl.py show --speaker-id '<speaker_id>'
 python3 backend/voiceprintctl.py templates --speaker-id '<speaker_id>'
 ```
 
+### 唤醒问候与姓名绑定
+
+后端会在受信任的 `VOICE_CONTEXT` 中额外提供：
+
+- `wake_event`：本轮是否从未激活状态刚刚被唤醒；连续对话中为 `false`。
+- `identity_named`：当前身份是否已有用户提供的名称；自动生成的 `访客 xxxxxxxx` 不算已命名。
+- `display_name` / `preferred_name`：当前可靠称呼。
+
+Hermes 按以下流程处理：
+
+```text
+冷启动唤醒 + 未命名身份
+  → 回应用户，并询问如何称呼
+  → 下一轮“我是 X / 我叫 X / 叫我 X”
+  → 调用 voiceprintctl rename 更新同一个 speaker_id
+
+冷启动唤醒 + 已命名身份
+  → 使用 preferred_name（否则 display_name）自然问候
+
+连续对话
+  → 不重复问候，也不会每轮重复询问姓名
+```
+
+名称更新成功后，后端会同步当前内存 session 的身份资料，无需等待下一次声纹解析。`speaker_id` 始终不变，只更新用户名称字段。
+
 ## 后台用户管理
 
 创建用户：
