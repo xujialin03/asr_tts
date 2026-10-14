@@ -51,7 +51,36 @@ export async function transcribeUtterance(sessionId, float32_16k) {
   return await r.json();
 }
 
-export async function decide(sessionId, text, source = "vad", assistantSpeaking = false) {
+export async function detectKeyword(float32_16k) {
+  const r = await fetch(`${BASE}/kws/detect`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: float32_16k.buffer,
+  });
+  if (!r.ok) throw new Error(`KWS detect failed: ${r.status} ${await r.text()}`);
+  return await r.json();
+}
+
+export async function resolveVoiceprint(sessionId, float32_16k) {
+  const r = await fetch(
+    `${BASE}/voiceprint/resolve?session_id=${encodeURIComponent(sessionId)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: float32_16k.buffer,
+    }
+  );
+  if (!r.ok) throw new Error(`voiceprint resolve failed: ${r.status} ${await r.text()}`);
+  return await r.json();
+}
+
+export async function decide(
+  sessionId,
+  text,
+  source = "vad",
+  assistantSpeaking = false,
+  kws = null
+) {
   const r = await fetch(`${BASE}/decide`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -60,6 +89,9 @@ export async function decide(sessionId, text, source = "vad", assistantSpeaking 
       text,
       source,
       assistant_speaking: assistantSpeaking,
+      kws_detected: !!kws?.detected,
+      kws_keyword: kws?.keyword || null,
+      kws_available: kws?.available ?? null,
     }),
   });
   if (!r.ok) throw new Error(`decide failed: ${r.status} ${await r.text()}`);

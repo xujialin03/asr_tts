@@ -22,7 +22,7 @@ import time
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import config
@@ -80,6 +80,7 @@ async def health() -> dict:
         "asr": config.ASR_BASE_URL,
         "assistant": "hermes",
         "tts": config.TTS_BASE_URL,
+        "kws": config.KWS_BASE_URL if config.KWS_ENABLED else "disabled",
     }
 
 
@@ -157,12 +158,193 @@ async def transcribe(request: Request, session_id: str) -> JSONResponse:
         raise HTTPException(status_code=502, detail=f"ASR transcribe failed: {type(e).__name__}: {e}")
 
 
+@app.post("/api/voiceprint/resolve")
+async def resolve_voiceprint(request: Request, session_id: str) -> JSONResponse:
+    """Resolve VAD audio to a stable speaker ID, creating an identity if unknown."""
+    s = _get_session(session_id)
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="audio body is empty")
+    try:
+        response = await client.post(
+            f"{config.VOICEPRINT_BASE_URL}/v1/resolve",
+            content=body,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=httpx.Timeout(30.0, connect=5.0),
+        )
+        response.raise_for_status()
+        result = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500]
+        raise HTTPException(
+            status_code=502,
+            detail=f"voiceprint resolve failed: {exc.response.status_code} {detail}",
+        ) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"voiceprint resolve failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    s.speaker_id = result["speaker_id"]
+    result["audio_ref"] = s.store_voice_audio(body)
+    return JSONResponse(result)
+
+
+class VoiceprintUserUpdate(BaseModel):
+    display_name: str | None = None
+    preferred_name: str | None = None
+
+
+async def _voiceprint_request(
+    method: str,
+    path: str,
+    *,
+    content: bytes | None = None,
+    json_body: dict | None = None,
+    params: dict | None = None,
+) -> dict | list | None:
+    try:
+        response = await client.request(
+            method,
+            f"{config.VOICEPRINT_BASE_URL}{path}",
+            content=content,
+            json=json_body,
+            params=params,
+            headers={"Content-Type": "application/octet-stream"} if content is not None else None,
+            timeout=httpx.Timeout(30.0, connect=5.0),
+        )
+        response.raise_for_status()
+        return response.json() if response.content else None
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text[:500]) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"voiceprint service failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@app.get("/api/voiceprint/users")
+async def voiceprint_users() -> JSONResponse:
+    return JSONResponse(await _voiceprint_request("GET", "/v1/users"))
+
+
+@app.get("/api/voiceprint/users/{speaker_id}")
+async def voiceprint_user(speaker_id: str) -> JSONResponse:
+    return JSONResponse(await _voiceprint_request("GET", f"/v1/users/{speaker_id}"))
+
+
+@app.patch("/api/voiceprint/users/{speaker_id}")
+async def update_voiceprint_user(speaker_id: str, req: VoiceprintUserUpdate) -> JSONResponse:
+    changes = req.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="no fields to update")
+    return JSONResponse(
+        await _voiceprint_request("PATCH", f"/v1/users/{speaker_id}", json_body=changes)
+    )
+
+
+@app.delete(
+    "/api/voiceprint/users/{speaker_id}",
+    status_code=204,
+    response_class=Response,
+)
+async def delete_voiceprint_user(speaker_id: str) -> Response:
+    await _voiceprint_request("DELETE", f"/v1/users/{speaker_id}")
+    return Response(status_code=204)
+
+
+@app.get("/api/voiceprint/users/{speaker_id}/voiceprints")
+async def voiceprint_templates(speaker_id: str) -> JSONResponse:
+    return JSONResponse(
+        await _voiceprint_request("GET", f"/v1/users/{speaker_id}/voiceprints")
+    )
+
+
+@app.post("/api/voiceprint/users/{speaker_id}/voiceprints/current", status_code=201)
+async def add_current_voiceprint(
+    speaker_id: str,
+    audio_ref: str,
+    label: str = "voice-command",
+) -> JSONResponse:
+    audio = sessions.find_voice_audio(speaker_id, audio_ref)
+    if audio is None:
+        raise HTTPException(status_code=404, detail="audio reference expired or does not belong to speaker")
+    result = await _voiceprint_request(
+        "POST",
+        f"/v1/users/{speaker_id}/voiceprints",
+        content=audio,
+        params={"label": label},
+    )
+    return JSONResponse(result, status_code=201)
+
+
+@app.delete("/api/voiceprint/users/{speaker_id}/voiceprints")
+async def delete_voiceprint_templates(speaker_id: str) -> JSONResponse:
+    return JSONResponse(
+        await _voiceprint_request("DELETE", f"/v1/users/{speaker_id}/voiceprints")
+    )
+
+
+@app.delete(
+    "/api/voiceprint/users/{speaker_id}/voiceprints/{voiceprint_id}",
+    status_code=204,
+    response_class=Response,
+)
+async def delete_voiceprint_template(speaker_id: str, voiceprint_id: str) -> Response:
+    await _voiceprint_request(
+        "DELETE", f"/v1/users/{speaker_id}/voiceprints/{voiceprint_id}"
+    )
+    return Response(status_code=204)
+
+
+@app.post("/api/kws/detect")
+async def kws_detect(request: Request) -> JSONResponse:
+    """Proxy complete VAD audio to the optional, replaceable KWS service."""
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="audio body is empty")
+    if not config.KWS_ENABLED:
+        return JSONResponse(
+            {"available": False, "detected": False, "keyword": None, "engine": "disabled"}
+        )
+    try:
+        response = await client.post(
+            f"{config.KWS_BASE_URL}/v1/detect",
+            content=body,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=httpx.Timeout(15.0, connect=2.0),
+        )
+        response.raise_for_status()
+        result = response.json()
+        result["available"] = True
+        return JSONResponse(result)
+    except (httpx.HTTPError, ValueError) as exc:
+        if config.KWS_FAIL_OPEN:
+            logger.warning("KWS unavailable, using exact text fallback: %s", exc)
+            return JSONResponse(
+                {
+                    "available": False,
+                    "detected": False,
+                    "keyword": None,
+                    "engine": "fallback",
+                }
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=f"KWS failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
 # ---- Hermes chat ----
 class DecideReq(BaseModel):
     session_id: str
     text: str
     source: str = "vad"
     assistant_speaking: bool = False
+    kws_detected: bool = False
+    kws_keyword: str | None = None
+    kws_available: bool | None = None
 
 
 @app.post("/api/decide")
@@ -181,7 +363,12 @@ async def decide(req: DecideReq) -> JSONResponse:
         else:
             should_reply, reason = False, "命中纯打断指令"
     else:
-        should_reply, reason = s.should_reply(req.text, req.source)
+        should_reply, reason = s.should_reply(
+            req.text,
+            req.source,
+            kws_detected=req.kws_detected,
+            kws_keyword=req.kws_keyword,
+        )
 
     return JSONResponse(
         {
@@ -189,6 +376,10 @@ async def decide(req: DecideReq) -> JSONResponse:
             "interrupt": interrupt,
             "reply_text": reply_text,
             "reason": reason,
+            "speaker_id": s.speaker_id,
+            "kws_detected": req.kws_detected,
+            "kws_keyword": req.kws_keyword,
+            "kws_available": req.kws_available,
             "active": s.is_active(),
             "active_remaining": round(s.active_remaining(), 1),
         }
@@ -233,6 +424,7 @@ async def chat(req: ChatReq) -> JSONResponse:
     return JSONResponse(
         {
             "reply": reply,
+            "speaker_id": s.speaker_id,
             "active": s.is_active(),
             "active_remaining": round(s.active_remaining(), 1),
         }

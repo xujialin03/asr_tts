@@ -34,6 +34,10 @@ ASR_BASE_URL = _url(services["asr"])
 TTS_BASE_URL = _url(services["tts"])
 _voiceprint_service = services.get("voiceprint", {"host": "127.0.0.1", "port": 8002})
 VOICEPRINT_BASE_URL = _url(_voiceprint_service)
+_kws_service = services.get("kws", {})
+KWS_ENABLED = bool(_kws_service.get("enabled", False))
+KWS_BASE_URL = _url(_kws_service) if _kws_service.get("host") else ""
+KWS_FAIL_OPEN = bool(_kws_service.get("fail_open", True))
 
 _postgresql = _cfg.get("database", {}).get("postgresql", {})
 POSTGRES_HOST = _postgresql.get("host", "127.0.0.1")

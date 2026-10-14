@@ -1,6 +1,6 @@
 # 本地声纹与用户服务
 
-该服务使用 CAM++ 模型 `iic/speech_campplus_sv_zh-cn_16k-common` 提取 192 维说话人向量，提供用户管理、声纹注册、指定用户验证和已注册用户识别 API。
+该服务使用 CAM++ 模型 `iic/speech_campplus_sv_zh-cn_16k-common` 提取 192 维说话人向量。正常交互无需显式注册：VAD 唤醒成功后调用解析接口，匹配已有身份或自动创建匿名身份并返回稳定的 `speaker_id`。用户管理和显式声纹接口保留用于后台维护。
 
 ## 设计
 
@@ -53,7 +53,68 @@ curl http://127.0.0.1:8002/health
 
 接口文档：<http://127.0.0.1:8002/docs>
 
-## 3. 用户管理
+## 自动身份解析
+
+现有前端在 VAD 取得完整语音、ASR 命中唤醒词或连续对话门控后，自动调用：
+
+```text
+POST /v1/resolve
+Content-Type: application/octet-stream
+Body: float32 PCM, 16 kHz, mono
+```
+
+- 匹配到已有声纹：返回原有 `speaker_id`，`created: false`。
+- 没有达到匹配阈值：在一个数据库事务中创建匿名用户及首个声纹模板，返回新 `speaker_id`，`created: true`。
+- 未通过唤醒门控的环境语音不会创建身份。
+- 身份创建由程序完成；Hermes 后续可以用 `speaker_id` 补充姓名、称呼和偏好，但不负责判定声纹是否相同。
+
+示例响应：
+
+```json
+{
+  "speaker_id": "7d8180d5-e5e8-4fe0-bb68-2d8ad117c647",
+  "created": true,
+  "score": null,
+  "speaker": {
+    "id": "7d8180d5-e5e8-4fe0-bb68-2d8ad117c647",
+    "username": "speaker-7d8180d5e5e84fe0bb682d8ad117c647",
+    "display_name": "访客 7d8180d5",
+    "preferred_name": null
+  }
+}
+```
+
+## Hermes 语音管理
+
+当前项目使用的 Hermes `worker` profile 已安装 `voiceprint-management` skill。每次通过门控的语音在发送给 Hermes 前，后端会附加受信任的机器上下文：
+
+```text
+[VOICE_CONTEXT]{"speaker_id":"...","audio_ref":"..."}[/VOICE_CONTEXT]
+```
+
+- `speaker_id` 用于查询和更新当前身份。
+- `audio_ref` 是当前 VAD 音频的短期不透明引用，约五分钟后失效，并且只能用于对应身份。
+- Hermes 通过 `python3 backend/voiceprintctl.py` 调用后端，不直接连接 PostgreSQL。
+- 添加当前声音、查询、命名和列出模板可以直接执行；删除模板、全部声纹或整个身份必须先说明影响并在下一轮取得明确确认。
+
+支持的自然语言示例：
+
+- “我是谁？”
+- “我叫许老板，以后叫我许老板。”
+- “把我现在这段声音添加为一个声纹模板，叫客厅麦克风。”
+- “我有几个声纹模板？”
+- “有哪些声纹用户？”
+- “删除我的全部声纹。”（Hermes 会先确认）
+
+`voiceprintctl.py` 也可供人工维护：
+
+```bash
+python3 backend/voiceprintctl.py list
+python3 backend/voiceprintctl.py show --speaker-id '<speaker_id>'
+python3 backend/voiceprintctl.py templates --speaker-id '<speaker_id>'
+```
+
+## 后台用户管理
 
 创建用户：
 
@@ -79,7 +140,7 @@ curl -X POST http://127.0.0.1:8002/v1/users \
 | `PATCH` | `/v1/users/{user_id}` | 更新部分用户字段 |
 | `DELETE` | `/v1/users/{user_id}` | 删除用户及其声纹 |
 
-## 4. 声纹注册与识别
+## 后台声纹注册与识别
 
 音频文件必须是裸 float32 PCM，不是 WAV 文件。现有前端 VAD 的 `Float32Array.buffer` 可以直接作为请求 body。
 

@@ -11,6 +11,13 @@ services:
     name: campplus
     host: 127.0.0.1
     port: 8002
+  kws:
+    enabled: true
+    name: sherpa-onnx
+    host: 127.0.0.1
+    port: 8003
+    # KWS unavailable时降级为原有精确文本唤醒，不阻断对话。
+    fail_open: true
 
 # PostgreSQL used by project-owned agent modules (for example, voice profiles).
 database:

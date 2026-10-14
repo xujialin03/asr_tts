@@ -13,3 +13,4 @@ dist/
 config.yaml
 temp.md
 voiceprint-service/models/
+kws-service/models/

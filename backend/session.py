@@ -10,6 +10,7 @@ The dedicated Hermes agent owns the assistant conversation and its history.
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import sys
 import time
@@ -43,6 +44,10 @@ class Session:
     # Last transcript seen from a chunk; used as a fallback if `finish` hangs.
     last_asr: dict = field(default_factory=lambda: {"language": "", "text": ""})
     active_until: float = 0.0
+    speaker_id: str | None = None
+    audio_ref: str | None = None
+    audio_ref_expires_at: float = 0.0
+    voice_audio: bytes | None = field(default=None, repr=False)
     chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     # ---- ASR lifecycle (relayed to the remote ASR service) ----
@@ -115,6 +120,21 @@ class Session:
     def active_remaining(self) -> float:
         return max(0.0, self.active_until - time.time())
 
+    def store_voice_audio(self, body: bytes, ttl_seconds: float = 300.0) -> str:
+        self.audio_ref = secrets.token_urlsafe(24)
+        self.audio_ref_expires_at = time.time() + ttl_seconds
+        self.voice_audio = body
+        return self.audio_ref
+
+    def get_voice_audio(self, audio_ref: str) -> bytes | None:
+        if (
+            not self.audio_ref
+            or not secrets.compare_digest(self.audio_ref, audio_ref)
+            or time.time() > self.audio_ref_expires_at
+        ):
+            return None
+        return self.voice_audio
+
     def match_interrupt(self, text: str) -> tuple[bool, str]:
         """Return (matched, remaining_text_after_interrupt_phrase)."""
         normalized = (text or "").strip()
@@ -127,16 +147,25 @@ class Session:
                 return True, remainder
         return False, normalized
 
-    def should_reply(self, text: str, source: str = "vad") -> tuple[bool, str]:
+    def should_reply(
+        self,
+        text: str,
+        source: str = "vad",
+        kws_detected: bool = False,
+        kws_keyword: str | None = None,
+    ) -> tuple[bool, str]:
         text = (text or "").strip()
         if not text:
             return False, "空识别结果"
         if source == "push_to_talk":
             self.activate()
             return True, "手动按住说话"
+        if kws_detected:
+            self.activate()
+            return True, f"声学唤醒词命中：{kws_keyword or '已配置关键词'}"
         if any(w and w in text for w in config.WAKE_WORDS):
             self.activate()
-            return True, "命中唤醒词"
+            return True, "命中精确文本唤醒词"
         if time.time() <= self.active_until:
             self.activate()
             return True, "连续对话窗口内"
@@ -144,11 +173,21 @@ class Session:
 
     # ---- Hermes turn ----
     async def _chat_hermes(self, user_text: str) -> str:
+        context = {
+            "speaker_id": self.speaker_id,
+            "audio_ref": self.audio_ref,
+        }
+        hermes_message = (
+            "[VOICE_CONTEXT]"
+            + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+            + "[/VOICE_CONTEXT]\n"
+            + user_text
+        )
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             config.HERMES_CLIENT_PATH,
             "ask",
-            user_text,
+            hermes_message,
             "--timeout",
             str(config.HERMES_TIMEOUT_SECONDS),
             stdout=asyncio.subprocess.PIPE,
@@ -205,6 +244,14 @@ class SessionManager:
         if sid and sid in self._store:
             return self._store[sid]
         return self.create()
+
+    def find_voice_audio(self, speaker_id: str, audio_ref: str) -> bytes | None:
+        for session in self._store.values():
+            if session.speaker_id == speaker_id:
+                audio = session.get_voice_audio(audio_ref)
+                if audio is not None:
+                    return audio
+        return None
 
     def delete(self, sid: str) -> bool:
         return self._store.pop(sid, None) is not None

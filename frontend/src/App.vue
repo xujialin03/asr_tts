@@ -5,6 +5,8 @@ import {
   pushChunk,
   finishSession,
   transcribeUtterance,
+  detectKeyword,
+  resolveVoiceprint,
   decide,
   touchSession,
   chat,
@@ -27,6 +29,8 @@ const error = ref("");
 const gateNotice = ref("");
 const aiActive = ref(false);
 const activeRemaining = ref(0);
+const speakerId = ref("");
+const speakerCreated = ref(false);
 const logEl = ref(null);
 const asrEl = ref(null);
 
@@ -332,31 +336,63 @@ async function handleVadAudio(audio) {
   const capturedDuringPlayback = vadCapturedDuringPlayback;
   vadCapturedDuringPlayback = false;
   vadProcessing = true;
+  let processingStage = "ASR";
   error.value = "";
   setStatus("finishing", "识别中…");
   try {
     const sid = await ensureSession();
-    const j = await transcribeUtterance(sid, audio);
-    language.value = j.language || "—";
-    asrText.value = j.text || "";
+    const [asrResult, kwsResult] = await Promise.all([
+      transcribeUtterance(sid, audio),
+      detectKeyword(audio).catch((err) => {
+        console.warn("KWS detect failed", err);
+        return { available: false, detected: false, keyword: null };
+      }),
+    ]);
+    language.value = asrResult.language || "—";
+    asrText.value = asrResult.text || "";
     setStatus("done", "已识别");
     const text = asrText.value.trim();
-    if (!text) return;
-    const decision = await decide(sid, text, "vad", capturedDuringPlayback);
+    const decisionText = text || kwsResult.keyword || "";
+    if (!decisionText) return;
+    processingStage = "唤醒判断";
+    const decision = await decide(
+      sid,
+      decisionText,
+      "vad",
+      capturedDuringPlayback,
+      kwsResult
+    );
     updateActive(decision);
     if (decision.interrupt) stopSpeak();
     if (decision.should_reply) {
-      gateNotice.value = decision.reason || "";
-      await sendToLLM(decision.reply_text || text);
+      processingStage = "声纹识别";
+      try {
+        const identity = await resolveVoiceprint(sid, audio);
+        speakerId.value = identity.speaker_id || "";
+        speakerCreated.value = !!identity.created;
+        gateNotice.value = identity.created
+          ? `${decision.reason || ""} · 已创建声纹身份 ${speakerId.value.slice(0, 8)}`
+          : `${decision.reason || ""} · 已识别声纹 ${speakerId.value.slice(0, 8)}`;
+      } catch (voiceprintError) {
+        // Voice identity enriches the turn but must not make ASR/chat unusable.
+        speakerId.value = "";
+        speakerCreated.value = false;
+        gateNotice.value = `${decision.reason || ""} · 声纹暂不可用，本次按匿名身份继续`;
+        console.warn("voiceprint resolve failed", voiceprintError);
+      }
+      processingStage = "AI 回复";
+      await sendToLLM(decision.reply_text || decisionText);
     } else {
       setStatus("idle", decision.interrupt ? "已打断" : "未触发回复");
       gateNotice.value = decision.reason || "未触发回复";
     }
   } catch (err) {
-    error.value = err.message;
-    asrText.value = "识别失败：远程 ASR 服务异常。";
-    scrollAsr();
-    setStatus("error", "识别失败");
+    error.value = `${processingStage}失败：${err.message}`;
+    if (processingStage === "ASR") {
+      asrText.value = "语音识别失败，请确认远程 ASR 服务状态。";
+      scrollAsr();
+    }
+    setStatus("error", `${processingStage}失败`);
   } finally {
     vadProcessing = false;
   }
@@ -431,6 +467,8 @@ function clearAll() {
   gateNotice.value = "";
   aiActive.value = false;
   activeRemaining.value = 0;
+  speakerId.value = "";
+  speakerCreated.value = false;
 }
 
 let activeTimer = null;
@@ -467,6 +505,9 @@ onBeforeUnmount(() => {
         <span class="pill">语言: {{ language }}</span>
         <span class="pill" :class="aiActive ? 'listening' : ''">
           {{ aiActive ? `AI 已激活 · ${Math.round(activeRemaining)}s` : "AI 未激活" }}
+        </span>
+        <span v-if="speakerId" class="pill" :class="speakerCreated ? 'finishing' : 'listening'">
+          {{ speakerCreated ? "新声纹" : "已识别" }} · {{ speakerId.slice(0, 8) }}
         </span>
         <span
           v-if="ttsState !== 'idle'"

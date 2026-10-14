@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
@@ -28,6 +29,10 @@ app = FastAPI(
     description="Local CAM++ speaker enrollment, verification, identification, and user management.",
     lifespan=lifespan,
 )
+
+# Serialize automatic resolution so two simultaneous first utterances cannot both
+# observe an empty identity set and create duplicate anonymous speakers.
+RESOLVE_LOCK = asyncio.Lock()
 
 
 class UserCreate(BaseModel):
@@ -88,6 +93,27 @@ def _decision(score: float, accept_threshold: float, uncertain_threshold: float)
     if score >= uncertain_threshold:
         return "uncertain"
     return "unknown"
+
+
+def _best_match(
+    query: list[float], candidates: list[dict[str, Any]]
+) -> tuple[float, dict[str, Any]] | None:
+    best_by_user: dict[UUID, tuple[float, dict[str, Any]]] = {}
+    for candidate in candidates:
+        score = _score(query, candidate["embedding"])
+        current = best_by_user.get(candidate["user_id"])
+        if current is None or score > current[0]:
+            best_by_user[candidate["user_id"]] = (score, candidate)
+    return max(best_by_user.values(), key=lambda item: item[0]) if best_by_user else None
+
+
+def _public_speaker(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": candidate["user_id"],
+        "username": candidate["username"],
+        "display_name": candidate["display_name"],
+        "preferred_name": candidate["preferred_name"],
+    }
 
 
 def _validate_thresholds(accept_threshold: float, uncertain_threshold: float) -> None:
@@ -176,11 +202,62 @@ async def list_voiceprints(user_id: UUID) -> list[dict[str, Any]]:
     return await database.list_voiceprints(user_id)
 
 
+@app.delete("/v1/users/{user_id}/voiceprints", status_code=200)
+async def delete_all_voiceprints(user_id: UUID) -> dict[str, Any]:
+    if await database.get_user(user_id) is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    deleted = await database.delete_all_voiceprints(user_id)
+    return {"user_id": user_id, "deleted": deleted}
+
+
 @app.delete("/v1/users/{user_id}/voiceprints/{voiceprint_id}", status_code=204)
 async def delete_voiceprint(user_id: UUID, voiceprint_id: UUID) -> Response:
     if not await database.delete_voiceprint(user_id, voiceprint_id):
         raise HTTPException(status_code=404, detail="voiceprint not found")
     return Response(status_code=204)
+
+
+@app.post("/v1/resolve")
+async def resolve_speaker(
+    request: Request,
+    accept_threshold: float = Query(default=settings.identify_threshold),
+) -> dict[str, Any]:
+    """Resolve an utterance to a stable speaker ID, creating one when unknown."""
+    if not -1 <= accept_threshold <= 1:
+        raise HTTPException(status_code=422, detail="accept_threshold must be between -1 and 1")
+    query, audio = await _audio_embedding(request)
+
+    async with RESOLVE_LOCK:
+        match = _best_match(query, await database.active_embeddings())
+        if match is not None and match[0] >= accept_threshold:
+            score, candidate = match
+            return {
+                "speaker_id": candidate["user_id"],
+                "created": False,
+                "score": round(score, 6),
+                "speaker": _public_speaker(candidate),
+                **audio["quality"],
+                "duration_ms": audio["duration_ms"],
+            }
+
+        speaker = await database.create_anonymous_speaker_with_voiceprint(
+            query,
+            **audio,
+        )
+        return {
+            "speaker_id": speaker["id"],
+            "created": True,
+            "score": round(match[0], 6) if match is not None else None,
+            "speaker": {
+                "id": speaker["id"],
+                "username": speaker["username"],
+                "display_name": speaker["display_name"],
+                "preferred_name": speaker["preferred_name"],
+            },
+            "voiceprint_id": speaker["voiceprint_id"],
+            **audio["quality"],
+            "duration_ms": audio["duration_ms"],
+        }
 
 
 @app.post("/v1/identify")
@@ -195,22 +272,10 @@ async def identify(
     if not candidates:
         return {"decision": "unknown", "score": None, "user": None, **audio["quality"], "duration_ms": audio["duration_ms"]}
 
-    best_by_user: dict[UUID, tuple[float, dict[str, Any]]] = {}
-    for candidate in candidates:
-        score = _score(query, candidate["embedding"])
-        current = best_by_user.get(candidate["user_id"])
-        if current is None or score > current[0]:
-            best_by_user[candidate["user_id"]] = (score, candidate)
-    score, match = max(best_by_user.values(), key=lambda item: item[0])
+    match = _best_match(query, candidates)
+    score, candidate = match
     decision = _decision(score, accept_threshold, uncertain_threshold)
-    user = None
-    if decision != "unknown":
-        user = {
-            "id": match["user_id"],
-            "username": match["username"],
-            "display_name": match["display_name"],
-            "preferred_name": match["preferred_name"],
-        }
+    user = _public_speaker(candidate) if decision != "unknown" else None
     return {
         "decision": decision,
         "score": round(score, 6),

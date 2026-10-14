@@ -1,4 +1,20 @@
 services:
+  kws:
+    build:
+      context: ./kws-service
+    container_name: qwen3-kws
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8003:8003"
+    environment:
+      KWS_MODEL_ROOT: /models
+      KWS_KEYWORDS_FILE: /app/keywords.txt
+      KWS_KEYWORDS_SCORE: ${KWS_KEYWORDS_SCORE:-1.5}
+      KWS_KEYWORDS_THRESHOLD: ${KWS_KEYWORDS_THRESHOLD:-0.20}
+      KWS_NUM_TRAILING_BLANKS: ${KWS_NUM_TRAILING_BLANKS:-1}
+    volumes:
+      - kws_models:/models
+
   voiceprint:
     build:
       context: ./voiceprint-service
@@ -20,4 +36,5 @@ services:
       - voiceprint_models:/models
 
 volumes:
+  kws_models:
   voiceprint_models:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 
@@ -130,6 +130,51 @@ async def delete_user(user_id: UUID) -> bool:
     return result == "DELETE 1"
 
 
+async def create_anonymous_speaker_with_voiceprint(
+    embedding: list[float],
+    duration_ms: int,
+    audio_sha256: str,
+    quality: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically create an anonymous speaker and its first voiceprint."""
+    speaker_id = uuid4()
+    username = f"speaker-{speaker_id.hex}"
+    display_name = f"访客 {speaker_id.hex[:8]}"
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            user = await conn.fetchrow(
+                """
+                INSERT INTO users (id, username, display_name, metadata)
+                VALUES ($1, $2, $3, $4::jsonb)
+                RETURNING id, username, display_name, preferred_name
+                """,
+                speaker_id,
+                username,
+                display_name,
+                json.dumps({"identity_source": "voiceprint_auto"}),
+            )
+            voiceprint = await conn.fetchrow(
+                """
+                INSERT INTO voiceprints (
+                    user_id, label, model_id, model_revision, embedding_dimension,
+                    embedding, duration_ms, sample_rate, audio_sha256, quality
+                ) VALUES ($1, $2, $3, $4, $5, $6::real[], $7, $8, $9, $10::jsonb)
+                RETURNING id
+                """,
+                speaker_id,
+                "auto-enrollment",
+                settings.model_id,
+                settings.model_revision,
+                len(embedding),
+                embedding,
+                duration_ms,
+                settings.sample_rate,
+                audio_sha256,
+                json.dumps(quality, ensure_ascii=False),
+            )
+    return {**dict(user), "voiceprint_id": voiceprint["id"]}
+
+
 async def add_voiceprint(
     user_id: UUID,
     label: str | None,
@@ -180,6 +225,11 @@ async def list_voiceprints(user_id: UUID) -> list[dict[str, Any]]:
         {**dict(row), "quality": _decode_json(row["quality"]) or {}}
         for row in rows
     ]
+
+
+async def delete_all_voiceprints(user_id: UUID) -> int:
+    result = await pool().execute("DELETE FROM voiceprints WHERE user_id = $1", user_id)
+    return int(result.rsplit(" ", 1)[-1])
 
 
 async def delete_voiceprint(user_id: UUID, voiceprint_id: UUID) -> bool:

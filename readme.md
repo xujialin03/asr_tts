@@ -6,9 +6,11 @@
 - 对话 Agent：项目专用 Hermes agent（由 Hermes 管理人设和对话历史）
 - 语音合成：Breeze-TTS-2 流式合成服务
 - 声纹识别：本地 CAM++ 服务 + PostgreSQL 用户/声纹管理
+- 关键词唤醒：独立可选 sherpa-onnx 中文 KWS 服务
 
 > 语音交互、会话激活和打断机制的详细设计见 [docs/voice-interaction-design.md](docs/voice-interaction-design.md)。
 > 本地声纹服务的部署、数据结构与 API 见 [docs/voiceprint-service.md](docs/voiceprint-service.md)。
+> 独立 KWS 服务的契约、配置与移除方式见 [docs/kws-service.md](docs/kws-service.md)。
 
 # Qwen3-ASR 语音转文字
 
@@ -26,7 +28,8 @@
 backend/              FastAPI 代理（uv 管理）
 frontend/             Vue 3 + Vite 前端
 voiceprint-service/   CAM++ 声纹与用户管理服务
-compose.yaml          本地声纹服务容器配置
+kws-service/          sherpa-onnx 关键词唤醒服务
+compose.yaml          本地 KWS/声纹服务容器配置
 docs/                 详细设计文档
 ```
 
