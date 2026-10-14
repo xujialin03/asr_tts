@@ -1,5 +1,5 @@
 <script setup>
-import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   startSession,
   pushChunk,
@@ -31,6 +31,8 @@ const aiActive = ref(false);
 const activeRemaining = ref(0);
 const speakerId = ref("");
 const speakerCreated = ref(false);
+const voiceEvents = ref([]); // {id, speakerId, text, score, created, time}
+const voiceLogEl = ref(null);
 const logEl = ref(null);
 const asrEl = ref(null);
 
@@ -42,6 +44,55 @@ const vadProb = ref(0);
 const vadActive = ref(false);
 const vadSilenceMs = ref(0);
 const vadSegmentMs = ref(0);
+
+const distinctSpeakers = computed(
+  () => new Set(voiceEvents.value.map((event) => event.speakerId)).size
+);
+
+const SPEAKER_COLORS = [
+  "#2563eb",
+  "#059669",
+  "#d97706",
+  "#7c3aed",
+  "#db2777",
+  "#0891b2",
+  "#dc2626",
+  "#4f46e5",
+];
+
+function speakerColor(id) {
+  let hash = 0;
+  for (const char of id || "") hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return SPEAKER_COLORS[hash % SPEAKER_COLORS.length];
+}
+
+function formatScore(score) {
+  return Number.isFinite(Number(score)) ? Number(score).toFixed(3) : "首次建档";
+}
+
+function formatEventTime(date = new Date()) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+async function addVoiceEvent(identity, text) {
+  const id = identity?.speaker_id;
+  if (!id) return;
+  voiceEvents.value.push({
+    id: `${Date.now()}-${voiceEvents.value.length}`,
+    speakerId: id,
+    text: (text || "").trim() || "（无识别文本）",
+    score: identity.score,
+    created: !!identity.created,
+    time: formatEventTime(),
+  });
+  await nextTick();
+  if (voiceLogEl.value) voiceLogEl.value.scrollTop = 0;
+}
 
 let audioCtx = null;
 let processor = null;
@@ -151,21 +202,28 @@ async function speak(index) {
   }
 }
 
-// Send recognized text to the LLM and show + speak the reply.
-async function sendToLLM(text) {
+function appendUserMessage(text) {
   const content = (text || "").trim();
-  if (!content) return;
-  error.value = "";
-  gateNotice.value = "";
-  sending.value = true;
+  if (!content) return "";
   messages.value.push({ role: "user", content });
-  // Clear the live-recognition box once the text has been sent.
   asrText.value = "";
   scrollLog();
+  return content;
+}
+
+// Send recognized text to the LLM and show + speak the reply.
+async function sendToLLM(text, { userMessageAdded = false } = {}) {
+  let content = (text || "").trim();
+  if (!content) return;
+  error.value = "";
+  sending.value = true;
+  if (!userMessageAdded) content = appendUserMessage(content);
+  const chatStartedAt = performance.now();
   try {
     const sid = await ensureSession();
     const result = await chat(sid, content);
     const reply = result.reply;
+    console.info(`[Voice timing] Hermes ${Math.round(performance.now() - chatStartedAt)}ms`);
     updateActive(result);
     messages.value.push({ role: "assistant", content: reply });
     scrollLog();
@@ -336,6 +394,8 @@ async function handleVadAudio(audio) {
   const capturedDuringPlayback = vadCapturedDuringPlayback;
   vadCapturedDuringPlayback = false;
   vadProcessing = true;
+  const turnStartedAt = performance.now();
+  let stageStartedAt = turnStartedAt;
   let processingStage = "ASR";
   error.value = "";
   setStatus("finishing", "识别中…");
@@ -348,6 +408,7 @@ async function handleVadAudio(audio) {
         return { available: false, detected: false, keyword: null };
       }),
     ]);
+    console.info(`[Voice timing] ASR+KWS ${Math.round(performance.now() - stageStartedAt)}ms`);
     language.value = asrResult.language || "—";
     asrText.value = asrResult.text || "";
     setStatus("done", "已识别");
@@ -355,6 +416,7 @@ async function handleVadAudio(audio) {
     const decisionText = text || kwsResult.keyword || "";
     if (!decisionText) return;
     processingStage = "唤醒判断";
+    stageStartedAt = performance.now();
     const decision = await decide(
       sid,
       decisionText,
@@ -362,14 +424,24 @@ async function handleVadAudio(audio) {
       capturedDuringPlayback,
       kwsResult
     );
+    console.info(`[Voice timing] Gate ${Math.round(performance.now() - stageStartedAt)}ms`);
     updateActive(decision);
     if (decision.interrupt) stopSpeak();
     if (decision.should_reply) {
+      const replyText = (decision.reply_text || decisionText).trim();
+      appendUserMessage(replyText);
+      console.info(
+        `[Voice timing] User text visible ${Math.round(performance.now() - turnStartedAt)}ms after VAD end`
+      );
+      gateNotice.value = `${decision.reason || ""} · 正在识别声纹`;
       processingStage = "声纹识别";
+      stageStartedAt = performance.now();
       try {
         const identity = await resolveVoiceprint(sid, audio);
+        console.info(`[Voice timing] Voiceprint ${Math.round(performance.now() - stageStartedAt)}ms`);
         speakerId.value = identity.speaker_id || "";
         speakerCreated.value = !!identity.created;
+        await addVoiceEvent(identity, text || decisionText);
         gateNotice.value = identity.created
           ? `${decision.reason || ""} · 已创建声纹身份 ${speakerId.value.slice(0, 8)}`
           : `${decision.reason || ""} · 已识别声纹 ${speakerId.value.slice(0, 8)}`;
@@ -381,7 +453,7 @@ async function handleVadAudio(audio) {
         console.warn("voiceprint resolve failed", voiceprintError);
       }
       processingStage = "AI 回复";
-      await sendToLLM(decision.reply_text || decisionText);
+      await sendToLLM(replyText, { userMessageAdded: true });
     } else {
       setStatus("idle", decision.interrupt ? "已打断" : "未触发回复");
       gateNotice.value = decision.reason || "未触发回复";
@@ -459,6 +531,10 @@ function onKey(e) {
   }
 }
 
+function clearVoiceEvents() {
+  voiceEvents.value = [];
+}
+
 function clearAll() {
   messages.value = [];
   asrText.value = "";
@@ -496,27 +572,31 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="wrap">
-    <div class="card">
-      <h1>语音助手 · ASR → LLM → TTS</h1>
-
-      <div class="row">
-        <span class="pill" :class="status">{{ statusText }}</span>
-        <span class="pill">语言: {{ language }}</span>
-        <span class="pill" :class="aiActive ? 'listening' : ''">
-          {{ aiActive ? `AI 已激活 · ${Math.round(activeRemaining)}s` : "AI 未激活" }}
-        </span>
-        <span v-if="speakerId" class="pill" :class="speakerCreated ? 'finishing' : 'listening'">
-          {{ speakerCreated ? "新声纹" : "已识别" }} · {{ speakerId.slice(0, 8) }}
-        </span>
-        <span
-          v-if="ttsState !== 'idle'"
-          class="pill"
-          :class="ttsState === 'playing' ? 'listening' : 'finishing'"
-        >
-          🔊 {{ ttsState === "synthesizing" ? "合成中…" : ttsState === "playing" ? "播放中…" : "播放完成" }}
-        </span>
-      </div>
+  <div class="app-shell">
+    <main class="card assistant-card">
+      <header class="app-header">
+        <div>
+          <h1>语音助手</h1>
+          <p>ASR · KWS · 声纹 · Hermes · TTS</p>
+        </div>
+        <div class="row status-row">
+          <span class="pill" :class="status">{{ statusText }}</span>
+          <span class="pill">语言: {{ language }}</span>
+          <span class="pill" :class="aiActive ? 'listening' : ''">
+            {{ aiActive ? `AI 已激活 · ${Math.round(activeRemaining)}s` : "AI 未激活" }}
+          </span>
+          <span v-if="speakerId" class="pill" :class="speakerCreated ? 'finishing' : 'listening'">
+            {{ speakerCreated ? "新声纹" : "已识别" }} · {{ speakerId.slice(0, 8) }}
+          </span>
+          <span
+            v-if="ttsState !== 'idle'"
+            class="pill"
+            :class="ttsState === 'playing' ? 'listening' : 'finishing'"
+          >
+            🔊 {{ ttsState === "synthesizing" ? "合成中…" : ttsState === "playing" ? "播放中…" : "播放完成" }}
+          </span>
+        </div>
+      </header>
 
       <div class="ptt-area">
         <button
@@ -541,12 +621,12 @@ onBeforeUnmount(() => {
             placeholder="实时识别内容会显示在这里…"
           ></textarea>
           <div class="hint">
-            {{ vadEnabled ? "免手持模式会持续监听麦克风，Mac 显示占用是正常的 · 说话自动识别，停顿后自动回复" : "按住说话，松开即识别并回复 · 播放中按住可打断 · 键盘长按空格" }}
+            {{ vadEnabled ? "免手持模式会持续监听麦克风 · 说话自动识别，停顿后自动回复" : "按住说话，松开即识别并回复 · 播放中按住可打断 · 键盘长按空格" }}
           </div>
         </div>
       </div>
 
-      <div class="row">
+      <div class="row controls-row">
         <button @click="clearAll">清空对话</button>
         <label class="toggle">
           <input type="checkbox" v-model="autoPlay" />
@@ -556,7 +636,7 @@ onBeforeUnmount(() => {
           <input type="checkbox" v-model="vadEnabled" @change="onVadToggle" />
           免手持语音（Silero VAD）
         </label>
-        <span v-if="vadEnabled" class="pill warn">建议戴耳机，避免外放回声误触发</span>
+        <span v-if="vadEnabled" class="pill warn">建议戴耳机</span>
         <span v-if="vadEnabled" class="pill" :class="vadActive ? 'listening' : ''">
           VAD {{ vadActive ? "说话中" : "监听中" }} · p={{ vadProb.toFixed(2) }} · 静音{{ Math.round(vadSilenceMs) }}ms · 段{{ Math.round(vadSegmentMs) }}ms
         </span>
@@ -565,10 +645,10 @@ onBeforeUnmount(() => {
       <div v-if="gateNotice" class="notice">{{ gateNotice }}</div>
 
       <div class="panel chatpanel">
-        <div class="label">对话</div>
+        <div class="panel-title">对话</div>
         <div id="log" ref="logEl">
           <div v-if="!messages.length" class="empty">
-            按住下方按钮说话，LLM 会以「台湾知心朋友」角色回复…
+            开启免手持模式或按住说话，识别到的声纹会同步显示在右侧。
           </div>
           <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
             <span class="who">{{ m.role === "user" ? "我" : "她" }}</span>
@@ -588,36 +668,107 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-if="error" class="err">⚠ {{ error }}</div>
-    </div>
+    </main>
+
+    <aside class="card voice-sidebar">
+      <header class="sidebar-header">
+        <div>
+          <h2>声纹识别记录</h2>
+          <p>本次页面会话</p>
+        </div>
+        <button class="ghost-button" :disabled="!voiceEvents.length" @click="clearVoiceEvents">清空</button>
+      </header>
+
+      <div class="voice-summary">
+        <div class="summary-item">
+          <strong>{{ distinctSpeakers }}</strong>
+          <span>不同声音</span>
+        </div>
+        <div class="summary-item">
+          <strong>{{ voiceEvents.length }}</strong>
+          <span>识别次数</span>
+        </div>
+      </div>
+
+      <div ref="voiceLogEl" class="voice-log">
+        <div v-if="!voiceEvents.length" class="voice-empty">
+          <span class="voice-empty-icon">◎</span>
+          <strong>等待声纹</strong>
+          <span>完成一次有效唤醒后，这里会显示声音 ID 和识别内容。</span>
+        </div>
+        <article
+          v-for="event in [...voiceEvents].reverse()"
+          :key="event.id"
+          class="voice-event"
+          :style="{ '--speaker-color': speakerColor(event.speakerId) }"
+        >
+          <div class="voice-event-head">
+            <div class="speaker-mark">
+              <span class="speaker-dot"></span>
+              <span>声纹 {{ event.speakerId.slice(0, 8) }}</span>
+            </div>
+            <time>{{ event.time }}</time>
+          </div>
+          <code class="speaker-full-id">{{ event.speakerId }}</code>
+          <p class="voice-text">{{ event.text }}</p>
+          <div class="voice-meta">
+            <span>{{ event.created ? "首次识别 · 已建档" : "已有声纹" }}</span>
+            <span>相似度 {{ formatScore(event.score) }}</span>
+          </div>
+        </article>
+      </div>
+    </aside>
   </div>
 </template>
 
 <style scoped>
-.wrap {
+.app-shell {
+  width: 100vw;
   height: 100vh;
-  padding: 16px;
-  box-sizing: border-box;
-  display: flex;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(340px, 28vw);
+  gap: 14px;
+  overflow: hidden;
 }
 .card {
-  width: 100%;
-  max-width: 860px;
-  height: 100%;
-  margin: 0 auto;
+  min-width: 0;
+  min-height: 0;
   background: #fff;
-  border: 1px solid #e5e7eb;
-  border-radius: 14px;
-  padding: 16px;
-  box-sizing: border-box;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.06);
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  box-shadow: 0 10px 32px rgba(15, 23, 42, 0.07);
+  overflow: hidden;
+}
+.assistant-card {
+  padding: 18px;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  overflow: hidden;
 }
-h1 {
-  font-size: 18px;
+.app-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+.app-header h1,
+.sidebar-header h2 {
   margin: 0;
+  color: #0f172a;
+}
+.app-header h1 {
+  font-size: 22px;
+  letter-spacing: -0.02em;
+}
+.app-header p,
+.sidebar-header p {
+  margin: 4px 0 0;
+  color: #94a3b8;
+  font-size: 12px;
+}
+.status-row {
+  justify-content: flex-end;
 }
 .row {
   display: flex;
@@ -762,10 +913,11 @@ button:disabled {
   display: flex;
   flex-direction: column;
 }
-.label {
-  color: #5b6472;
-  font-size: 12px;
-  margin-bottom: 6px;
+.panel-title {
+  color: #475569;
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 8px;
 }
 #log {
   flex: 1;
@@ -828,6 +980,157 @@ button:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
+.voice-sidebar {
+  display: flex;
+  flex-direction: column;
+  background: #f8fafc;
+}
+.sidebar-header {
+  padding: 18px 18px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #e2e8f0;
+  background: #fff;
+}
+.sidebar-header h2 {
+  font-size: 17px;
+}
+.ghost-button {
+  padding: 7px 11px;
+  border-radius: 9px;
+  font-size: 12px;
+  color: #64748b;
+  background: transparent;
+}
+.voice-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #e2e8f0;
+}
+.summary-item {
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #fff;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.summary-item strong {
+  font-size: 22px;
+  line-height: 1;
+  color: #0f172a;
+}
+.summary-item span {
+  font-size: 12px;
+  color: #64748b;
+}
+.voice-log {
+  flex: 1;
+  min-height: 0;
+  padding: 14px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.voice-empty {
+  flex: 1;
+  min-height: 220px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 24px;
+}
+.voice-empty strong {
+  color: #64748b;
+  font-size: 14px;
+}
+.voice-empty-icon {
+  width: 46px;
+  height: 46px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px dashed #cbd5e1;
+  font-size: 24px;
+  color: #64748b;
+}
+.voice-event {
+  position: relative;
+  padding: 13px 13px 12px 16px;
+  border: 1px solid #e2e8f0;
+  border-radius: 13px;
+  background: #fff;
+  box-shadow: 0 3px 12px rgba(15, 23, 42, 0.04);
+  overflow: hidden;
+}
+.voice-event::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: var(--speaker-color);
+}
+.voice-event-head,
+.voice-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.voice-event-head time,
+.voice-meta {
+  color: #94a3b8;
+  font-size: 11px;
+}
+.speaker-mark {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 800;
+}
+.speaker-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--speaker-color);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--speaker-color) 16%, transparent);
+}
+.speaker-full-id {
+  display: block;
+  margin-top: 7px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #94a3b8;
+  font-size: 10px;
+  background: transparent;
+}
+.voice-text {
+  margin: 10px 0;
+  color: #0f172a;
+  font-size: 14px;
+  line-height: 1.55;
+  word-break: break-word;
+}
+.voice-meta {
+  padding-top: 9px;
+  border-top: 1px solid #f1f5f9;
+}
 .err {
   color: #9f1239;
   font-size: 13px;
@@ -835,5 +1138,45 @@ button:disabled {
 .notice {
   color: #64748b;
   font-size: 13px;
+}
+@media (max-width: 980px) {
+  .app-shell {
+    height: auto;
+    min-height: 100vh;
+    grid-template-columns: 1fr;
+    overflow: visible;
+  }
+  .assistant-card {
+    min-height: calc(100vh - 28px);
+  }
+  .voice-sidebar {
+    min-height: 520px;
+  }
+  .app-header {
+    flex-direction: column;
+  }
+  .status-row {
+    justify-content: flex-start;
+  }
+}
+@media (max-width: 620px) {
+  .app-shell {
+    padding: 8px;
+    gap: 8px;
+  }
+  .assistant-card {
+    padding: 12px;
+    border-radius: 12px;
+  }
+  .ptt-area {
+    align-items: stretch;
+  }
+  .ptt {
+    width: 86px;
+    height: 86px;
+  }
+  .controls-row {
+    align-items: flex-start;
+  }
 }
 </style>

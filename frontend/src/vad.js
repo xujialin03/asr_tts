@@ -13,7 +13,7 @@ import { MicVAD } from "@ricky0123/vad-web";
 const SAMPLE_RATE = 16000;
 const START_THRESHOLD = 0.5;
 const END_THRESHOLD = 0.45;
-const END_SILENCE_MS = 1100;
+const END_SILENCE_MS = 750;
 const MIN_SPEECH_MS = 250;
 const PRE_ROLL_MS = 800;
 const MAX_UTTERANCE_MS = 15000;
