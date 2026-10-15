@@ -8,7 +8,7 @@ Frontend flow:
   POST /api/session/start   -> create local interaction session -> {session_id}
   POST /api/chunk           -> stream float32 PCM to ASR        -> {language, text}
   POST /api/finish          -> finish ASR                       -> {language, text}
-  POST /api/chat            -> send text to Hermes              -> {reply, tts_instruction}
+  POST /api/chat            -> consume an admitted turn in Hermes -> {reply, tts_instruction}
   POST /api/tts             -> synthesize speech (streaming PCM)
 """
 
@@ -20,13 +20,13 @@ import logging
 import time
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import config
-from session import ASR_CHUNK_BYTES, sessions
+from session import ASR_CHUNK_BYTES, SpeakerIdentity, sessions
 
 # Long read timeout: a chunk call blocks until the remote returns a transcript.
 client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
@@ -91,7 +91,19 @@ async def session_start() -> JSONResponse:
     # lazily when audio is actually sent; otherwise VAD/chat-only usage leaks
     # idle remote ASR sessions and eventually makes the ASR service hang.
     s = sessions.create()
-    return JSONResponse({"session_id": s.id, "asr_session_id": None})
+    return JSONResponse({**s.snapshot(), "asr_session_id": None})
+
+
+@app.get("/api/session/{session_id}")
+async def session_state(session_id: str) -> JSONResponse:
+    return JSONResponse(_get_session(session_id).snapshot())
+
+
+@app.delete("/api/session/{session_id}", status_code=204, response_class=Response)
+async def end_session(session_id: str) -> Response:
+    if not sessions.delete(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    return Response(status_code=204)
 
 
 def _get_session(session_id: str):
@@ -158,13 +170,7 @@ async def transcribe(request: Request, session_id: str) -> JSONResponse:
         raise HTTPException(status_code=502, detail=f"ASR transcribe failed: {type(e).__name__}: {e}")
 
 
-@app.post("/api/voiceprint/resolve")
-async def resolve_voiceprint(request: Request, session_id: str) -> JSONResponse:
-    """Resolve VAD audio to a stable speaker ID, creating an identity if unknown."""
-    s = _get_session(session_id)
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="audio body is empty")
+async def _resolve_speaker(body: bytes) -> dict:
     try:
         response = await client.post(
             f"{config.VOICEPRINT_BASE_URL}/v1/resolve",
@@ -173,7 +179,7 @@ async def resolve_voiceprint(request: Request, session_id: str) -> JSONResponse:
             timeout=httpx.Timeout(30.0, connect=5.0),
         )
         response.raise_for_status()
-        result = response.json()
+        return response.json()
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:500]
         raise HTTPException(
@@ -185,20 +191,16 @@ async def resolve_voiceprint(request: Request, session_id: str) -> JSONResponse:
             status_code=502,
             detail=f"voiceprint resolve failed: {type(exc).__name__}: {exc}",
         ) from exc
-    s.speaker_id = result["speaker_id"]
-    speaker = result.get("speaker") or {}
-    s.speaker_display_name = speaker.get("display_name")
-    s.speaker_preferred_name = speaker.get("preferred_name")
-    s.speaker_identity_named = bool(
-        s.speaker_preferred_name
-        or (
-            s.speaker_display_name
-            and not s.speaker_display_name.startswith("访客 ")
-        )
-    )
-    result["identity_named"] = s.speaker_identity_named
-    result["audio_ref"] = s.store_voice_audio(body)
-    return JSONResponse(result)
+
+
+@app.post("/api/voiceprint/resolve")
+async def resolve_voiceprint(request: Request, session_id: str) -> JSONResponse:
+    """Resolve audio for diagnostics without changing conversation membership."""
+    _get_session(session_id)
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="audio body is empty")
+    return JSONResponse(await _resolve_speaker(body))
 
 
 class VoiceprintUserUpdate(BaseModel):
@@ -268,6 +270,7 @@ async def update_voiceprint_user(speaker_id: str, req: VoiceprintUserUpdate) -> 
 )
 async def delete_voiceprint_user(speaker_id: str) -> Response:
     await _voiceprint_request("DELETE", f"/v1/users/{speaker_id}")
+    sessions.remove_speaker(speaker_id)
     return Response(status_code=204)
 
 
@@ -353,54 +356,110 @@ async def kws_detect(request: Request) -> JSONResponse:
         ) from exc
 
 
-# ---- Hermes chat ----
-class DecideReq(BaseModel):
-    session_id: str
-    text: str
+# ---- multi-speaker conversation turns ----
+class BeginTurnReq(BaseModel):
     source: str = "vad"
     assistant_speaking: bool = False
-    kws_detected: bool = False
-    kws_keyword: str | None = None
-    kws_available: bool | None = None
 
 
-@app.post("/api/decide")
-async def decide(req: DecideReq) -> JSONResponse:
-    s = _get_session(req.session_id)
-    interrupt = False
-    reply_text = req.text.strip()
-
-    if req.assistant_speaking:
-        interrupt, reply_text = s.match_interrupt(req.text)
-        if not interrupt:
-            should_reply, reason = False, "播放期间未命中打断词，视为环境干扰"
-        elif reply_text:
-            s.activate()
-            should_reply, reason = True, "命中打断词并包含后续问题"
-        else:
-            should_reply, reason = False, "命中纯打断指令"
-    else:
-        should_reply, reason = s.should_reply(
-            req.text,
-            req.source,
-            kws_detected=req.kws_detected,
-            kws_keyword=req.kws_keyword,
-        )
-
+@app.post("/api/session/{session_id}/turns")
+async def begin_turn(session_id: str, req: BeginTurnReq) -> JSONResponse:
+    if req.source != "vad":
+        raise HTTPException(status_code=422, detail="source must be vad")
+    turn = _get_session(session_id).begin_turn(req.source, req.assistant_speaking)
     return JSONResponse(
         {
-            "should_reply": should_reply,
-            "interrupt": interrupt,
-            "reply_text": reply_text,
-            "reason": reason,
-            "speaker_id": s.speaker_id,
-            "kws_detected": req.kws_detected,
-            "kws_keyword": req.kws_keyword,
-            "kws_available": req.kws_available,
-            "active": s.is_active(),
-            "active_remaining": round(s.active_remaining(), 1),
+            "turn_id": turn.id,
+            "sequence": turn.sequence,
+            "started_while_active": turn.started_while_active,
+            "expires_at": turn.expires_at,
         }
     )
+
+
+@app.post("/api/session/{session_id}/turns/{turn_id}/evaluate")
+async def evaluate_turn(
+    session_id: str,
+    turn_id: str,
+    audio: UploadFile,
+    text: str = Form(default=""),
+    language: str = Form(default=""),
+    kws_detected: bool = Form(default=False),
+    kws_keyword: str | None = Form(default=None),
+    kws_available: bool | None = Form(default=None),
+) -> JSONResponse:
+    session = _get_session(session_id)
+    body = await audio.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="audio body is empty")
+
+    async with session.turn_lock:
+        turn = session.get_turn(turn_id)
+        if not turn:
+            raise HTTPException(status_code=404, detail="turn not found or expired")
+        if turn.evaluated:
+            raise HTTPException(status_code=409, detail="turn already evaluated")
+
+        wake_detected = kws_detected or any(
+            word and word in text for word in config.WAKE_WORDS
+        )
+        needs_identity = (
+            turn.started_while_active
+            or session.is_active()
+            or wake_detected
+            or bool(session.participants)
+        )
+        if not needs_identity:
+            turn = session.reject_turn(turn_id, "未命中唤醒词且会话未激活")
+        else:
+            try:
+                identity = SpeakerIdentity.from_result(await _resolve_speaker(body))
+            except HTTPException as exc:
+                turn = session.reject_turn(
+                    turn_id,
+                    f"声纹识别失败，本段未发送给助手：{exc.detail}",
+                )
+            else:
+                try:
+                    turn = session.evaluate_turn(
+                        turn_id,
+                        identity,
+                        body,
+                        text=text,
+                        language=language,
+                        kws_detected=kws_detected,
+                        kws_keyword=kws_keyword,
+                    )
+                except (KeyError, ValueError) as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    result = turn.public()
+    result.update(
+        {
+            "kws_detected": kws_detected,
+            "kws_keyword": kws_keyword,
+            "kws_available": kws_available,
+            "session": session.snapshot(),
+        }
+    )
+    return JSONResponse(result)
+
+
+@app.post("/api/session/{session_id}/participants/{speaker_id}")
+async def join_participant(session_id: str, speaker_id: str) -> JSONResponse:
+    session = _get_session(session_id)
+    participant = session.add_participant(speaker_id)
+    if participant is None:
+        raise HTTPException(status_code=404, detail="observed speaker not found")
+    return JSONResponse(session.snapshot())
+
+
+@app.delete("/api/session/{session_id}/participants/{speaker_id}")
+async def remove_participant(session_id: str, speaker_id: str) -> JSONResponse:
+    session = _get_session(session_id)
+    if session.remove_participant(speaker_id) is None:
+        raise HTTPException(status_code=404, detail="participant not found")
+    return JSONResponse(session.snapshot())
 
 
 class TouchReq(BaseModel):
@@ -412,37 +471,41 @@ class TouchReq(BaseModel):
 @app.post("/api/touch")
 async def touch(req: TouchReq) -> JSONResponse:
     s = _get_session(req.session_id)
-    # Speech-start may only extend an already active session. TTS playback is
-    # allowed to force an extension because the assistant is already replying.
-    was_active = s.is_active()
-    if was_active or req.force:
+    if req.force:
         s.activate(req.seconds)
     return JSONResponse(
         {
             "active": s.is_active(),
             "active_remaining": round(s.active_remaining(), 1),
-            "extended": was_active or req.force,
+            "extended": req.force,
         }
     )
 
 
 class ChatReq(BaseModel):
     session_id: str
-    text: str
+    turn_id: str
 
 
 @app.post("/api/chat")
 async def chat(req: ChatReq) -> JSONResponse:
     s = _get_session(req.session_id)
     try:
-        reply = await s.chat(req.text)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Hermes call failed: {e}")
+        reply = await s.chat(req.turn_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Hermes call failed: {exc}") from exc
+    turn = s.get_turn(req.turn_id)
     return JSONResponse(
         {
             "reply": reply.text,
             "tts_instruction": reply.instruction,
-            "speaker_id": s.speaker_id,
+            "speaker_id": turn.speaker.speaker_id if turn and turn.speaker else None,
             "active": s.is_active(),
             "active_remaining": round(s.active_remaining(), 1),
         }

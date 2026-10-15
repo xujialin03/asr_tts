@@ -7,7 +7,7 @@
 ```text
 麦克风
   ↓
-Silero VAD（免手持模式）或 Push-to-talk（手动模式）
+Silero VAD（唯一语音输入模式，可通过界面开关启停）
   ↓
 Qwen3-ASR
   ↓
@@ -22,24 +22,9 @@ Qwen3-ASR
 
 前端负责麦克风、VAD、播放和用户交互；FastAPI 后端负责本地 Session、门控状态和远程服务代理。项目专用 Hermes agent 独占管理助理人设、对话上下文和历史，backend 不保存或同步对话历史。Hermes 的最终响应使用 `{"text":"...","instruction":"..."}`：`text` 用于页面展示和朗读，`instruction` 作为本轮动态 Voice Direction 传给 TTS；解析失败时兼容旧的纯文本回复。
 
-## 2. 输入模式
+## 2. Silero VAD 输入模式
 
-### 2.1 Push-to-talk
-
-用户按住按钮开始录音，松开后结束：
-
-1. 浏览器采集单声道音频；
-2. 重采样为 16kHz float32 PCM；
-3. 每 500ms 推送一个 ASR chunk；
-4. 松开时发送尾部不足 500ms 的缓冲，并调用 ASR finish；
-5. Push-to-talk 是显式操作，因此识别文本默认视为对 AI 说话，不要求唤醒词。
-
-关键实现：
-
-- `frontend/src/App.vue`：`onHoldStart`、`onHoldEnd`、`startRecording`、`stopRecording`
-- `frontend/src/asrClient.js`：`pushChunk`、`finishSession`
-
-### 2.2 Silero VAD 免手持模式
+Silero VAD 是应用唯一的语音输入方式。用户通过界面开关开启或关闭持续监听；项目不再提供按住说话、空格键录音或流式 `/api/chunk`、`/api/finish` 的前端入口。
 
 Silero VAD 持续监听麦克风，根据每帧 `isSpeech` 概率切分完整 utterance：
 
@@ -60,7 +45,29 @@ VAD 在 `onSpeechEnd(audio)` 产生完整 16kHz float32 PCM 片段，前端将�
 
 免手持模式开启时，浏览器会持续占用麦克风，macOS 显示麦克风使用状态属于预期行为。关闭免手持模式或离开页面时必须调用 `stopVad` 和 `releaseSharedStream`。
 
-## 3. 唤醒词与连续对话
+## 3. 多人参与会话与连续对话
+
+免手持模式以声纹参与资格控制谁可以进入 Hermes：
+
+```text
+第一位说出唤醒词的人 → 声纹识别 → 自动成为参与人 1 → 激活并回复
+激活期间已加入参与人 → 允许连续对话并续期
+激活期间新声纹       → 只进入“侦听到”列表，不回复、不续期
+手动加入新声纹       → 从下一轮起成为参与人
+踢出参与人           → 后续发言只被侦听，不进入 Hermes
+```
+
+后端在 speech-start 创建 turn，记录当时是否处于激活窗口；speech-end 后统一执行声纹解析和门控。前端不能直接提交 `speaker_id` 绕过参与资格。只有 evaluate 获准的 `turn_id` 能被 `/api/chat` 消费，且同一 turn 只能消费一次。
+
+空房间中只有说出唤醒词的声纹会成为首位参与人；普通环境语音不会自动加入。房间已有参与人后，陌生人不能通过重复说唤醒词绕过手动加入。声纹服务失败时 fail closed，本段不会发送给 Hermes。
+
+当前多人支持指多人轮流发言。重叠讲话仍会被 VAD、ASR 和 CAM++ 当作一个混合片段；可靠支持重叠语音需要额外的 diarization、源分离或多麦克风能力。
+
+关键实现：
+
+- `backend/session.py`：`Participant`、`ObservedSpeaker`、`VoiceTurn`、`evaluate_turn`
+- `backend/main.py`：turn begin/evaluate、参与人加入/踢出、按 turn 调用 chat
+- `frontend/src/App.vue`：VAD 轮次队列、参与人和侦听列表
 
 免手持模式识别到环境人声后，不应直接调用 Hermes。文本先经过门控；冷启动时必须明确命中唤醒词，普通问句和指令不会自行激活：
 
@@ -177,7 +184,7 @@ ASR 转写
 
 ### 5.2 手动打断
 
-用户在免手持模式中按下 Push-to-talk 按钮，或按 `Esc`，属于明确操作，仍然立即调用 `stopSpeak`，不经过文本匹配。
+用户按 `Esc` 或点击单条回复的停止/播放控制属于明确操作，可以立即调用 `stopSpeak`，不经过语音文本匹配。
 
 ### 5.3 统一停止入口
 

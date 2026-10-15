@@ -1,11 +1,4 @@
-"""Per-session state for the voice interaction pipeline.
-
-A Session keeps only application-local state:
-  - the remote ASR streaming session id (start/chunk/finish), and
-  - the wake/continuous-conversation activation window.
-
-The dedicated Hermes agent owns the assistant conversation and its history.
-"""
+"""Per-session state for the multi-speaker voice interaction pipeline."""
 
 from __future__ import annotations
 
@@ -22,6 +15,9 @@ import config
 
 ASR_CHUNK_BYTES = 8000 * 4  # 500ms @ 16kHz float32 mono
 MAX_TTS_INSTRUCTION_CHARS = 500
+TURN_TTL_SECONDS = 300.0
+AUDIO_REF_TTL_SECONDS = 300.0
+MAX_OBSERVED_SPEAKERS = 32
 
 VOICE_RESPONSE_CONTRACT = """[VOICE_RESPONSE_CONTRACT]
 Your final answer will be displayed to the user and synthesized by Breeze-TTS-2.
@@ -56,11 +52,7 @@ def parse_hermes_reply(raw_reply: str) -> HermesReply:
         if len(lines) >= 3:
             candidates.insert(0, "\n".join(lines[1:-1]).strip())
 
-    # Also tolerate a short preamble before the JSON. The contract still asks
-    # Hermes for JSON-only output, but this keeps a model formatting slip from
-    # leaking JSON into the UI or spoken audio.
     candidates.extend(raw_reply[index:] for index, char in enumerate(raw_reply) if char == "{")
-
     for candidate in candidates:
         try:
             value, _ = decoder.raw_decode(candidate)
@@ -83,35 +75,162 @@ def parse_hermes_reply(raw_reply: str) -> HermesReply:
 def _pad_asr_chunk(body: bytes) -> bytes:
     if not body:
         return body
-    # Remote ASR is happiest with fixed 500ms float32 chunks. Pad short final
-    # chunks with silence instead of sending arbitrary short buffers.
     if len(body) < ASR_CHUNK_BYTES:
         return body + (b"\x00" * (ASR_CHUNK_BYTES - len(body)))
-    # Keep float32 alignment if a caller ever sends odd byte counts.
     rem = len(body) % 4
     if rem:
         return body + (b"\x00" * (4 - rem))
     return body
 
 
+def _identity_named(display_name: str | None, preferred_name: str | None) -> bool:
+    return bool(preferred_name or (display_name and not display_name.startswith("访客 ")))
+
+
+@dataclass
+class SpeakerIdentity:
+    speaker_id: str
+    display_name: str | None = None
+    preferred_name: str | None = None
+    identity_named: bool = False
+    created: bool = False
+    score: float | None = None
+
+    @classmethod
+    def from_result(cls, result: dict) -> "SpeakerIdentity":
+        speaker = result.get("speaker") or {}
+        display_name = speaker.get("display_name")
+        preferred_name = speaker.get("preferred_name")
+        return cls(
+            speaker_id=str(result["speaker_id"]),
+            display_name=display_name,
+            preferred_name=preferred_name,
+            identity_named=_identity_named(display_name, preferred_name),
+            created=bool(result.get("created")),
+            score=result.get("score"),
+        )
+
+    def public(self) -> dict:
+        return {
+            "speaker_id": self.speaker_id,
+            "display_name": self.display_name,
+            "preferred_name": self.preferred_name,
+            "identity_named": self.identity_named,
+            "created": self.created,
+            "score": self.score,
+        }
+
+
+@dataclass
+class Participant:
+    identity: SpeakerIdentity
+    number: int
+    joined_at: float
+    joined_by: str
+    last_seen_at: float
+    last_score: float | None = None
+    turn_count: int = 0
+
+    def public(self) -> dict:
+        return {
+            **self.identity.public(),
+            "participant_number": self.number,
+            "joined_at": self.joined_at,
+            "joined_by": self.joined_by,
+            "last_seen_at": self.last_seen_at,
+            "last_score": self.last_score,
+            "turn_count": self.turn_count,
+        }
+
+
+@dataclass
+class ObservedSpeaker:
+    identity: SpeakerIdentity
+    first_seen_at: float
+    last_seen_at: float
+    last_text: str = ""
+    last_score: float | None = None
+    observation_count: int = 1
+
+    def public(self) -> dict:
+        return {
+            **self.identity.public(),
+            "first_seen_at": self.first_seen_at,
+            "last_seen_at": self.last_seen_at,
+            "last_text": self.last_text,
+            "last_score": self.last_score,
+            "observation_count": self.observation_count,
+        }
+
+
+@dataclass
+class VoiceTurn:
+    id: str
+    sequence: int
+    source: str
+    assistant_speaking: bool
+    started_at: float
+    started_while_active: bool
+    expires_at: float
+    text: str = ""
+    language: str = ""
+    speaker: SpeakerIdentity | None = None
+    participant_number: int | None = None
+    wake_event: bool = False
+    auto_joined: bool = False
+    should_reply: bool = False
+    interrupt: bool = False
+    reply_text: str = ""
+    reason: str = ""
+    audio_ref: str | None = None
+    evaluated: bool = False
+    consumed: bool = False
+
+    def public(self) -> dict:
+        return {
+            "turn_id": self.id,
+            "sequence": self.sequence,
+            "source": self.source,
+            "started_while_active": self.started_while_active,
+            "speaker": self.speaker.public() if self.speaker else None,
+            "membership": {
+                "is_participant": self.participant_number is not None,
+                "participant_number": self.participant_number,
+            },
+            "wake_event": self.wake_event,
+            "auto_joined": self.auto_joined,
+            "should_reply": self.should_reply,
+            "interrupt": self.interrupt,
+            "reply_text": self.reply_text,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class VoiceAudioRef:
+    token: str
+    speaker_id: str
+    turn_id: str | None
+    body: bytes = field(repr=False)
+    expires_at: float = 0.0
+
+
 @dataclass
 class Session:
     id: str
     asr_session_id: str | None = None
-    # Last transcript seen from a chunk; used as a fallback if `finish` hangs.
     last_asr: dict = field(default_factory=lambda: {"language": "", "text": ""})
     active_until: float = 0.0
-    speaker_id: str | None = None
-    speaker_display_name: str | None = None
-    speaker_preferred_name: str | None = None
-    speaker_identity_named: bool = False
-    wake_event: bool = False
-    audio_ref: str | None = None
-    audio_ref_expires_at: float = 0.0
-    voice_audio: bytes | None = field(default=None, repr=False)
+    participants: dict[str, Participant] = field(default_factory=dict)
+    observed_speakers: dict[str, ObservedSpeaker] = field(default_factory=dict)
+    turns: dict[str, VoiceTurn] = field(default_factory=dict)
+    voice_audio_refs: dict[str, VoiceAudioRef] = field(default_factory=dict)
+    next_participant_number: int = 1
+    next_turn_sequence: int = 1
+    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
-    # ---- ASR lifecycle (relayed to the remote ASR service) ----
+    # ---- ASR lifecycle ----
     async def asr_start(self, client: httpx.AsyncClient) -> str:
         r = await client.post(
             f"{config.ASR_BASE_URL}/api/start",
@@ -123,13 +242,10 @@ class Session:
         return self.asr_session_id
 
     async def asr_chunk(self, client: httpx.AsyncClient, body: bytes) -> dict:
-        # The remote ASR session ends after `finish`; transparently start a new
-        # one so the same backend Session can be reused across conversations.
         if not self.asr_session_id:
             await self.asr_start(client)
         r = await self._post_chunk(client, body)
         if r.status_code == 400:
-            # Remote session died mid-stream: restart once and retry.
             await self.asr_start(client)
             r = await self._post_chunk(client, body)
         r.raise_for_status()
@@ -147,8 +263,6 @@ class Session:
         )
 
     async def asr_finish(self, client: httpx.AsyncClient) -> dict:
-        # Idempotent: a second finish (e.g. button + VAD racing) returns the
-        # last known transcript instead of erroring.
         if not self.asr_session_id:
             return dict(self.last_asr)
         try:
@@ -160,19 +274,14 @@ class Session:
             r.raise_for_status()
             j = r.json()
         except (httpx.HTTPError, ValueError):
-            # Remote `finish` hung or errored: fall back to the last chunk's
-            # cumulative transcript so the turn still completes.
             j = dict(self.last_asr)
-        # The remote session is now closed (or abandoned); drop it so the next
-        # recording starts fresh.
         self.asr_session_id = None
         return j
 
-    # ---- turn gate ----
+    # ---- activation and turns ----
     def activate(self, seconds: float | None = None) -> None:
         duration = config.ACTIVE_WINDOW_SECONDS if seconds is None else seconds
         duration = max(1.0, min(float(duration), 300.0))
-        # Never shorten an already longer active window.
         self.active_until = max(self.active_until, time.time() + duration)
 
     def is_active(self) -> bool:
@@ -181,23 +290,212 @@ class Session:
     def active_remaining(self) -> float:
         return max(0.0, self.active_until - time.time())
 
-    def store_voice_audio(self, body: bytes, ttl_seconds: float = 300.0) -> str:
-        self.audio_ref = secrets.token_urlsafe(24)
-        self.audio_ref_expires_at = time.time() + ttl_seconds
-        self.voice_audio = body
-        return self.audio_ref
+    def cleanup_expired(self) -> None:
+        now = time.time()
+        self.turns = {
+            turn_id: turn
+            for turn_id, turn in self.turns.items()
+            if turn.expires_at >= now or (turn.evaluated and not turn.consumed)
+        }
+        self.voice_audio_refs = {
+            token: ref for token, ref in self.voice_audio_refs.items() if ref.expires_at >= now
+        }
 
-    def get_voice_audio(self, audio_ref: str) -> bytes | None:
-        if (
-            not self.audio_ref
-            or not secrets.compare_digest(self.audio_ref, audio_ref)
-            or time.time() > self.audio_ref_expires_at
-        ):
-            return None
-        return self.voice_audio
+    def begin_turn(self, source: str, assistant_speaking: bool) -> VoiceTurn:
+        self.cleanup_expired()
+        now = time.time()
+        turn = VoiceTurn(
+            id=secrets.token_urlsafe(24),
+            sequence=self.next_turn_sequence,
+            source=source,
+            assistant_speaking=assistant_speaking,
+            started_at=now,
+            started_while_active=self.is_active(),
+            expires_at=now + TURN_TTL_SECONDS,
+        )
+        self.next_turn_sequence += 1
+        self.turns[turn.id] = turn
+        return turn
+
+    def get_turn(self, turn_id: str) -> VoiceTurn | None:
+        self.cleanup_expired()
+        return self.turns.get(turn_id)
+
+    def _add_participant(self, identity: SpeakerIdentity, joined_by: str) -> Participant:
+        existing = self.participants.get(identity.speaker_id)
+        if existing:
+            return existing
+        now = time.time()
+        participant = Participant(
+            identity=identity,
+            number=self.next_participant_number,
+            joined_at=now,
+            joined_by=joined_by,
+            last_seen_at=now,
+            last_score=identity.score,
+        )
+        self.next_participant_number += 1
+        self.participants[identity.speaker_id] = participant
+        self.observed_speakers.pop(identity.speaker_id, None)
+        return participant
+
+    def _observe(self, identity: SpeakerIdentity, text: str) -> ObservedSpeaker:
+        now = time.time()
+        observed = self.observed_speakers.get(identity.speaker_id)
+        if observed:
+            observed.identity = identity
+            observed.last_seen_at = now
+            observed.last_text = text
+            observed.last_score = identity.score
+            observed.observation_count += 1
+        else:
+            observed = ObservedSpeaker(
+                identity=identity,
+                first_seen_at=now,
+                last_seen_at=now,
+                last_text=text,
+                last_score=identity.score,
+            )
+            self.observed_speakers[identity.speaker_id] = observed
+        if len(self.observed_speakers) > MAX_OBSERVED_SPEAKERS:
+            oldest = min(self.observed_speakers.values(), key=lambda item: item.last_seen_at)
+            self.observed_speakers.pop(oldest.identity.speaker_id, None)
+        return observed
+
+    def add_participant(self, speaker_id: str) -> Participant | None:
+        observed = self.observed_speakers.get(speaker_id)
+        if not observed:
+            return self.participants.get(speaker_id)
+        return self._add_participant(observed.identity, "manual")
+
+    def remove_participant(self, speaker_id: str) -> Participant | None:
+        participant = self.participants.pop(speaker_id, None)
+        if participant:
+            self._observe(participant.identity, "")
+        return participant
+
+    def store_voice_audio(
+        self,
+        body: bytes,
+        speaker_id: str,
+        turn_id: str | None,
+        ttl_seconds: float = AUDIO_REF_TTL_SECONDS,
+    ) -> str:
+        self.cleanup_expired()
+        token = secrets.token_urlsafe(24)
+        self.voice_audio_refs[token] = VoiceAudioRef(
+            token=token,
+            speaker_id=speaker_id,
+            turn_id=turn_id,
+            body=body,
+            expires_at=time.time() + ttl_seconds,
+        )
+        return token
+
+    def get_voice_audio(self, speaker_id: str, audio_ref: str) -> bytes | None:
+        self.cleanup_expired()
+        for token, ref in self.voice_audio_refs.items():
+            if secrets.compare_digest(token, audio_ref):
+                return ref.body if ref.speaker_id == speaker_id else None
+        return None
+
+    def _wake_detected(self, text: str, kws_detected: bool) -> bool:
+        return kws_detected or any(word and word in text for word in config.WAKE_WORDS)
+
+    def evaluate_turn(
+        self,
+        turn_id: str,
+        identity: SpeakerIdentity,
+        audio: bytes,
+        *,
+        text: str,
+        language: str,
+        kws_detected: bool,
+        kws_keyword: str | None,
+    ) -> VoiceTurn:
+        turn = self.get_turn(turn_id)
+        if not turn:
+            raise KeyError("turn not found or expired")
+        if turn.evaluated:
+            raise ValueError("turn already evaluated")
+
+        text = (text or "").strip()
+        wake_detected = self._wake_detected(text, kws_detected)
+        # A turn normally snapshots activation at speech-start. Also honor the
+        # current server-side window at evaluation time: queued VAD turns can be
+        # created just before an earlier turn activates the session, and should
+        # not require the same participant to repeat the wake word.
+        active_for_turn = turn.started_while_active or self.is_active()
+        turn.text = text
+        turn.language = language
+        turn.speaker = identity
+        turn.wake_event = wake_detected and not active_for_turn
+        turn.audio_ref = self.store_voice_audio(audio, identity.speaker_id, turn.id)
+
+        participant = self.participants.get(identity.speaker_id)
+        if participant is None and not self.participants and wake_detected:
+            participant = self._add_participant(identity, "wake")
+            turn.auto_joined = True
+        elif participant is None:
+            self._observe(identity, text)
+
+        if participant is None:
+            turn.reason = "侦听到未加入会话的声纹"
+            turn.evaluated = True
+            return turn
+
+        participant.identity = identity
+        participant.last_seen_at = time.time()
+        participant.last_score = identity.score
+        participant.turn_count += 1
+        turn.participant_number = participant.number
+
+        if turn.assistant_speaking:
+            matched, remainder = self.match_interrupt(text)
+            turn.interrupt = matched
+            if not matched:
+                turn.reason = "播放期间未命中打断词，视为环境干扰"
+            elif remainder:
+                turn.should_reply = True
+                turn.reply_text = remainder
+                turn.reason = "参与人命中打断词并包含后续问题"
+                self.activate()
+            else:
+                turn.reason = "参与人命中纯打断指令"
+                self.activate()
+            turn.evaluated = True
+            return turn
+
+        allowed = wake_detected or active_for_turn
+        if not allowed:
+            turn.reason = "会话未激活，请先说唤醒词"
+        elif not text:
+            turn.reason = "空识别结果"
+        else:
+            turn.should_reply = True
+            turn.reply_text = text
+            if wake_detected:
+                turn.reason = (
+                    f"参与人命中声学唤醒词：{kws_keyword or '已配置关键词'}"
+                    if kws_detected
+                    else "参与人命中精确文本唤醒词"
+                )
+            else:
+                turn.reason = "参与人在连续对话窗口内"
+            self.activate()
+
+        turn.evaluated = True
+        return turn
+
+    def reject_turn(self, turn_id: str, reason: str) -> VoiceTurn:
+        turn = self.get_turn(turn_id)
+        if not turn:
+            raise KeyError("turn not found or expired")
+        turn.reason = reason
+        turn.evaluated = True
+        return turn
 
     def match_interrupt(self, text: str) -> tuple[bool, str]:
-        """Return (matched, remaining_text_after_interrupt_phrase)."""
         normalized = (text or "").strip()
         for pattern in config.INTERRUPT_PATTERNS:
             match = pattern.search(normalized)
@@ -208,49 +506,48 @@ class Session:
                 return True, remainder
         return False, normalized
 
-    def should_reply(
-        self,
-        text: str,
-        source: str = "vad",
-        kws_detected: bool = False,
-        kws_keyword: str | None = None,
-    ) -> tuple[bool, str]:
-        text = (text or "").strip()
-        if not text:
-            return False, "空识别结果"
-        if source == "push_to_talk":
-            self.activate()
-            return True, "手动按住说话"
-        was_active = self.is_active()
-        if kws_detected:
-            self.wake_event = not was_active
-            self.activate()
-            return True, f"声学唤醒词命中：{kws_keyword or '已配置关键词'}"
-        if any(w and w in text for w in config.WAKE_WORDS):
-            self.wake_event = not was_active
-            self.activate()
-            return True, "命中精确文本唤醒词"
-        if time.time() <= self.active_until:
-            self.activate()
-            return True, "连续对话窗口内"
-        return False, "未命中唤醒词且不在连续对话窗口"
+    def snapshot(self) -> dict:
+        participants = sorted(self.participants.values(), key=lambda item: item.number)
+        observed = sorted(
+            self.observed_speakers.values(), key=lambda item: item.last_seen_at, reverse=True
+        )
+        return {
+            "session_id": self.id,
+            "active": self.is_active(),
+            "active_remaining": round(self.active_remaining(), 1),
+            "participants": [participant.public() for participant in participants],
+            "observed_speakers": [speaker.public() for speaker in observed],
+        }
 
     # ---- Hermes turn ----
-    async def _chat_hermes(self, user_text: str) -> str:
+    async def _chat_hermes(self, turn: VoiceTurn) -> str:
+        participant = self.participants[turn.speaker.speaker_id]
         context = {
-            "speaker_id": self.speaker_id,
-            "audio_ref": self.audio_ref,
-            "wake_event": self.wake_event,
-            "identity_named": self.speaker_identity_named,
-            "display_name": self.speaker_display_name,
-            "preferred_name": self.speaker_preferred_name,
+            "session_id": self.id,
+            "turn_id": turn.id,
+            "turn_sequence": turn.sequence,
+            "source": turn.source,
+            "wake_event": turn.wake_event,
+            "speaker": {
+                **turn.speaker.public(),
+                "participant_number": participant.number,
+            },
+            "participants": [
+                {
+                    **item.identity.public(),
+                    "participant_number": item.number,
+                }
+                for item in sorted(self.participants.values(), key=lambda value: value.number)
+            ],
+            "participant_count": len(self.participants),
+            "audio_ref": turn.audio_ref,
         }
         hermes_message = (
             VOICE_RESPONSE_CONTRACT
             + "[VOICE_CONTEXT]"
             + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
             + "[/VOICE_CONTEXT]\n"
-            + user_text
+            + turn.reply_text
         )
         process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -264,8 +561,7 @@ class Session:
         )
         try:
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=config.HERMES_TIMEOUT_SECONDS + 10,
+                process.communicate(), timeout=config.HERMES_TIMEOUT_SECONDS + 10
             )
         except BaseException:
             if process.returncode is None:
@@ -275,7 +571,6 @@ class Session:
                 except asyncio.TimeoutError:
                     pass
             raise
-
         if process.returncode != 0:
             detail = stderr.decode(errors="replace").strip()
             raise RuntimeError(detail or f"Hermes client exited with {process.returncode}")
@@ -284,18 +579,41 @@ class Session:
             raise RuntimeError("Hermes returned an empty response")
         return reply
 
-    async def chat(self, user_text: str) -> HermesReply:
-        """Send one turn to the dedicated Hermes agent."""
-        user_text = (user_text or "").strip()
-        if not user_text:
-            return HermesReply(text="")
-
+    async def chat(self, turn_id: str) -> HermesReply:
         async with self.chat_lock:
-            raw_reply = await self._chat_hermes(user_text)
-            reply = parse_hermes_reply(raw_reply)
-            self.wake_event = False
-            self.activate()
-            return reply
+            turn = self.get_turn(turn_id)
+            if not turn or not turn.evaluated:
+                raise KeyError("turn not found, expired, or not evaluated")
+            if not turn.should_reply:
+                raise PermissionError("turn was not admitted to the conversation")
+            if turn.consumed:
+                raise ValueError("turn already consumed")
+            if not turn.speaker or turn.speaker.speaker_id not in self.participants:
+                raise PermissionError("speaker is no longer a conversation participant")
+            raw_reply = await self._chat_hermes(turn)
+            turn.consumed = True
+            return parse_hermes_reply(raw_reply)
+
+    def update_speaker_profile(
+        self,
+        speaker_id: str,
+        display_name: str | None,
+        preferred_name: str | None,
+    ) -> None:
+        identity = None
+        if speaker_id in self.participants:
+            identity = self.participants[speaker_id].identity
+        elif speaker_id in self.observed_speakers:
+            identity = self.observed_speakers[speaker_id].identity
+        if identity:
+            identity.display_name = display_name
+            identity.preferred_name = preferred_name
+            identity.identity_named = _identity_named(display_name, preferred_name)
+        for turn in self.turns.values():
+            if turn.speaker and turn.speaker.speaker_id == speaker_id:
+                turn.speaker.display_name = display_name
+                turn.speaker.preferred_name = preferred_name
+                turn.speaker.identity_named = _identity_named(display_name, preferred_name)
 
 
 class SessionManager:
@@ -304,24 +622,18 @@ class SessionManager:
 
     def create(self) -> Session:
         sid = secrets.token_hex(16)
-        s = Session(id=sid)
-        self._store[sid] = s
-        return s
+        session = Session(id=sid)
+        self._store[sid] = session
+        return session
 
     def get(self, sid: str) -> Session | None:
         return self._store.get(sid)
 
-    def get_or_create(self, sid: str | None) -> Session:
-        if sid and sid in self._store:
-            return self._store[sid]
-        return self.create()
-
     def find_voice_audio(self, speaker_id: str, audio_ref: str) -> bytes | None:
         for session in self._store.values():
-            if session.speaker_id == speaker_id:
-                audio = session.get_voice_audio(audio_ref)
-                if audio is not None:
-                    return audio
+            audio = session.get_voice_audio(speaker_id, audio_ref)
+            if audio is not None:
+                return audio
         return None
 
     def update_speaker_profile(
@@ -330,18 +642,21 @@ class SessionManager:
         display_name: str | None,
         preferred_name: str | None,
     ) -> None:
-        identity_named = bool(
-            preferred_name or (display_name and not display_name.startswith("访客 "))
-        )
         for session in self._store.values():
-            if session.speaker_id == speaker_id:
-                session.speaker_display_name = display_name
-                session.speaker_preferred_name = preferred_name
-                session.speaker_identity_named = identity_named
+            session.update_speaker_profile(speaker_id, display_name, preferred_name)
+
+    def remove_speaker(self, speaker_id: str) -> None:
+        for session in self._store.values():
+            session.participants.pop(speaker_id, None)
+            session.observed_speakers.pop(speaker_id, None)
+            session.voice_audio_refs = {
+                token: ref
+                for token, ref in session.voice_audio_refs.items()
+                if ref.speaker_id != speaker_id
+            }
 
     def delete(self, sid: str) -> bool:
         return self._store.pop(sid, None) is not None
 
 
-# One shared manager for the whole app.
 sessions = SessionManager()

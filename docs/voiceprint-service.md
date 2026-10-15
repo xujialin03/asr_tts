@@ -1,6 +1,6 @@
 # 本地声纹与用户服务
 
-该服务使用 CAM++ 模型 `iic/speech_campplus_sv_zh-cn_16k-common` 提取 192 维说话人向量。正常交互无需显式注册：VAD 唤醒成功后调用解析接口，匹配已有身份或自动创建匿名身份并返回稳定的 `speaker_id`。用户管理和显式声纹接口保留用于后台维护。
+该服务使用 CAM++ 模型 `iic/speech_campplus_sv_zh-cn_16k-common` 提取 192 维说话人向量。声纹服务只负责解析稳定身份；是否能参与当前对话由 FastAPI backend 的会话参与人状态决定。首位唤醒者会自动加入，激活期间识别到的其他身份只进入侦听列表，用户手动加入后才可进入 Hermes。
 
 ## 设计
 
@@ -89,10 +89,11 @@ Body: float32 PCM, 16 kHz, mono
 当前项目使用的 Hermes `worker` profile 已安装 `voiceprint-management` skill。每次通过门控的语音在发送给 Hermes 前，后端会附加受信任的机器上下文：
 
 ```text
-[VOICE_CONTEXT]{"speaker_id":"...","audio_ref":"..."}[/VOICE_CONTEXT]
+[VOICE_CONTEXT]{"session_id":"...","turn_id":"...","speaker":{"speaker_id":"...","participant_number":1},"participants":[...],"audio_ref":"..."}[/VOICE_CONTEXT]
 ```
 
-- `speaker_id` 用于查询和更新当前身份。
+- `speaker.speaker_id` 表示当前已获准轮次的发言人，用于查询和更新当前身份。
+- `speaker.participant_number` 是当前会话内稳定编号；`participants` 只包含已加入者，不包含侦听到的陌生声音。
 - `audio_ref` 是当前 VAD 音频的短期不透明引用，约五分钟后失效，并且只能用于对应身份。
 - Hermes 通过 `python3 backend/voiceprintctl.py` 调用后端，不直接连接 PostgreSQL。
 - 添加当前声音、查询、命名和列出模板可以直接执行；删除模板、全部声纹或整个身份必须先说明影响并在下一轮取得明确确认。

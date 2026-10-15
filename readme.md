@@ -6,15 +6,14 @@
 
 ## 功能
 
-- 🎙️ **按住说话**：按住按钮或空格录音，松开后完成识别并发送给 Hermes。
-- 👂 **免手持语音**：Silero VAD 持续监听麦克风，自动检测说话起止并切分完整语音片段。
+- 👂 **纯 VAD 语音**：Silero VAD 是唯一语音输入模式；通过界面开关持续监听麦克风，自动检测说话起止并切分完整语音片段。
 - 🔔 **关键词唤醒**：冷启动时由 sherpa-onnx 声学 KWS 或 ASR 文本唤醒词激活助手；KWS 不可用时可降级为文本唤醒。
 - 💬 **连续对话**：激活后在配置的时间窗口内无需重复唤醒，TTS 播放期间会自动延长窗口。
 - ✋ **语音打断**：AI 播放期间先完成 ASR，再根据打断词确认是否停止播放，减少环境声音造成的误打断。
 - 🧠 **Hermes 对话**：项目专用 Hermes agent 管理助理人设、上下文和对话历史，并为每条回复输出适配内容的 TTS 语气指令。
 - 🔊 **流式语音回复**：Breeze-TTS-2 返回裸 PCM，浏览器边接收边播放；支持自动朗读、单条重播和停止播放。
-- 🗣️ **声纹识别**：有效唤醒后由 CAM++ 匹配已有身份，或自动创建匿名 `speaker_id`。
-- 📋 **声纹记录**：页面侧栏展示本次会话识别到的声音数量、声纹 ID、识别文本、相似度和建档状态。
+- 🗣️ **多人声纹会话**：首位唤醒者自动成为参与人 1；激活期间听到的新声纹只进入侦听列表，手动加入后才可参与对话。
+- 👥 **参与人管理**：页面侧栏分别展示已加入参与人和侦听到的声音，支持加入和踢出；被踢出者后续不会触发 Hermes。
 
 > 交互状态机和设计约束见 [语音交互详细设计](docs/voice-interaction-design.md)。
 
@@ -34,22 +33,20 @@
 
 ```text
 浏览器（Vue 3）
-  ├─ Push-to-talk：按住说话，松开识别
-  ├─ Silero VAD：持续监听，自动切分 utterance
+  ├─ Silero VAD：唯一输入模式，开关控制持续监听和 utterance 切分
   └─ Web Audio：播放流式 PCM
           │
           ▼
 FastAPI backend
-  ├─ /api/chunk + /api/finish ─────────▶ 远程 Qwen3-ASR（按住说话）
   ├─ /api/transcribe ──────────────────▶ 远程 Qwen3-ASR（VAD 整段转写）
   ├─ /api/kws/detect ──────────────────▶ 本地 sherpa-onnx KWS
-  ├─ /api/decide ──────────────────────▶ 唤醒词 / 连续对话 / 打断门控
-  ├─ /api/voiceprint/resolve ──────────▶ 本地 CAM++ ─▶ PostgreSQL
+  ├─ /api/session/.../turns/evaluate ──▶ 声纹解析 + 参与资格 + 唤醒/打断门控
+  ├─ /api/session/.../participants ────▶ 加入 / 踢出会话参与人
   ├─ /api/chat ────────────────────────▶ 项目专用 Hermes agent
   └─ /api/tts ─────────────────────────▶ 远程 Breeze-TTS-2
 ```
 
-免手持模式下，ASR 与 KWS 会并行处理完整语音片段。只有门控判定需要回复后，才会解析声纹并调用 Hermes；未触发的环境语音只显示识别结果，不创建声纹身份。
+免手持模式下，ASR 与 KWS 会并行处理完整语音片段。首位说出唤醒词的人经声纹识别后自动加入会话；会话激活期间每段语音都会先确认声纹和参与资格，未加入者只出现在侦听列表，不会进入聊天或 Hermes 上下文。当前“多人会话”支持多人轮流发言，不包含重叠讲话的说话人分离。
 
 远程 ASR/TTS 不需要向浏览器开放 CORS，浏览器只访问 FastAPI；开发环境下 Vite 再将 `/api/*` 代理到 FastAPI。
 
@@ -75,7 +72,7 @@ config.yaml.example   应用配置模板
 - 可访问的 Qwen3-ASR 与 Breeze-TTS-2 服务
 - 可调用的项目专用 Hermes agent client
 
-如果只调试部分链路，KWS 可关闭；声纹服务不可用时，对话会按匿名身份继续。
+如果只调试部分链路，KWS 可关闭。参与资格依赖声纹确认；声纹服务不可用、音频过短或识别失败时，本段会 fail closed，不会发送给 Hermes。
 
 ## 配置
 
@@ -186,21 +183,18 @@ npm run dev
 
 ## 使用方式
 
-### 按住说话
+### Silero VAD 语音
 
-按住页面中的麦克风按钮或键盘空格开始录音，松开后完成识别并直接发送给 Hermes。该模式属于显式操作，不要求唤醒词；播放中按住可立即停止当前回复。
-
-### 免手持语音
-
-开启“免手持语音（Silero VAD）”后，浏览器会持续占用麦克风：
+开启“Silero VAD 语音监听”后，浏览器会持续占用麦克风：
 
 1. VAD 检测到停顿后提交完整语音；
 2. ASR 与 KWS 并行处理；
 3. 冷启动需命中声学 KWS 或配置的文本唤醒词；
 4. 激活窗口内可连续对话；
-5. 门控通过后执行声纹解析、Hermes 回复和流式 TTS。
+5. 后端识别声纹并检查当前会话参与资格；首位唤醒者自动加入，其他新声纹仅进入侦听列表；
+6. 已加入参与人的有效轮次才会调用 Hermes 和流式 TTS。
 
-外放的 TTS 可能被麦克风重新采集，建议免手持模式下使用耳机。
+外放的 TTS 可能被麦克风重新采集，建议开启 VAD 时使用耳机。关闭 VAD 开关后浏览器会释放麦克风。
 
 ## 后端 API 概览
 
@@ -208,13 +202,13 @@ npm run dev
 |---|---|---|
 | `GET` | `/health` | 后端状态与上游服务地址 |
 | `POST` | `/api/session/start` | 创建本地交互 session，远程 ASR 按需懒启动 |
-| `POST` | `/api/chunk?session_id=<id>` | 推送原始 float32 PCM（16kHz、单声道）到 ASR |
-| `POST` | `/api/finish?session_id=<id>` | 结束一次流式 ASR |
 | `POST` | `/api/transcribe?session_id=<id>` | 转写 VAD 产生的完整语音片段 |
 | `POST` | `/api/kws/detect` | 调用可选的本地 KWS 服务 |
-| `POST` | `/api/decide` | 执行唤醒、连续对话和打断门控 |
-| `POST` | `/api/voiceprint/resolve?session_id=<id>` | 匹配或创建声纹身份 |
-| `POST` | `/api/chat` | 将当前用户话语发送给 Hermes |
+| `GET` | `/api/session/{id}` | 查询激活状态、已加入参与人和侦听列表 |
+| `POST` | `/api/session/{id}/turns` | 在 speech-start 创建不可变语音轮次 |
+| `POST` | `/api/session/{id}/turns/{turn_id}/evaluate` | 解析声纹并执行参与资格、唤醒和打断门控 |
+| `POST/DELETE` | `/api/session/{id}/participants/{speaker_id}` | 加入或踢出会话参与人 |
+| `POST` | `/api/chat` | 消费已获准的 `turn_id` 并发送给 Hermes |
 | `POST` | `/api/touch` | 延长连续对话激活窗口 |
 | `POST` | `/api/tts` | 代理流式 TTS PCM |
 

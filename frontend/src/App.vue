@@ -1,22 +1,21 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   startSession,
-  pushChunk,
-  finishSession,
+  getSession,
+  endSession,
+  beginTurn,
+  evaluateTurn,
+  joinParticipant,
+  removeParticipant,
   transcribeUtterance,
   detectKeyword,
-  resolveVoiceprint,
-  decide,
   touchSession,
   chat,
-  resampleLinear,
 } from "./asrClient.js";
 import { playTts, stopPlayback } from "./ttsPlayer.js";
 import { startVad, stopVad, releaseSharedStream } from "./vad.js";
 
-const TARGET_SR = 16000;
-const CHUNK_MS = 500;
 const POST_REPLY_ACTIVE_SECONDS = 20;
 
 const status = ref("idle"); // idle | listening | finishing | error | done
@@ -31,7 +30,10 @@ const aiActive = ref(false);
 const activeRemaining = ref(0);
 const speakerId = ref("");
 const speakerCreated = ref(false);
-const voiceEvents = ref([]); // {id, speakerId, text, score, created, time}
+const participants = ref([]);
+const observedSpeakers = ref([]);
+const memberBusy = ref("");
+const voiceEvents = ref([]); // diagnostic history, not membership state
 const voiceLogEl = ref(null);
 const logEl = ref(null);
 const asrEl = ref(null);
@@ -44,10 +46,6 @@ const vadProb = ref(0);
 const vadActive = ref(false);
 const vadSilenceMs = ref(0);
 const vadSegmentMs = ref(0);
-
-const distinctSpeakers = computed(
-  () => new Set(voiceEvents.value.map((event) => event.speakerId)).size
-);
 
 const SPEAKER_COLORS = [
   "#2563eb",
@@ -94,16 +92,7 @@ async function addVoiceEvent(identity, text) {
   if (voiceLogEl.value) voiceLogEl.value.scrollTop = 0;
 }
 
-let audioCtx = null;
-let processor = null;
-let source = null;
-let mediaStream = null;
 let sessionId = null;
-let running = false;
-let buf = new Float32Array(0);
-let pushing = false;
-let holdActive = false; // pointer/key currently held for push-to-talk
-let wantRecording = false; // unified record intent (button OR VAD)
 
 function setStatus(s, label) {
   status.value = s;
@@ -132,16 +121,24 @@ async function extendActiveForPlayback(remainingSeconds, force = false) {
   } catch (_) {}
 }
 
-function concatFloat32(a, b) {
-  const out = new Float32Array(a.length + b.length);
-  out.set(a, 0);
-  out.set(b, a.length);
-  return out;
+async function ensureSession() {
+  if (!sessionId) {
+    const state = await startSession();
+    sessionId = state.session_id;
+    applySessionState(state);
+  }
+  return sessionId;
 }
 
-async function ensureSession() {
-  if (!sessionId) sessionId = await startSession();
-  return sessionId;
+function applySessionState(state) {
+  if (!state) return;
+  participants.value = state.participants || [];
+  observedSpeakers.value = state.observed_speakers || [];
+  updateActive(state);
+}
+
+function speakerName(speaker) {
+  return speaker?.preferred_name || speaker?.display_name || `声纹 ${(speaker?.speaker_id || "").slice(0, 8)}`;
 }
 
 async function scrollLog() {
@@ -203,26 +200,30 @@ async function speak(index) {
   }
 }
 
-function appendUserMessage(text) {
+function appendUserMessage(text, speaker = null) {
   const content = (text || "").trim();
   if (!content) return "";
-  messages.value.push({ role: "user", content });
+  messages.value.push({
+    role: "user",
+    content,
+    speakerLabel: speaker
+      ? `参与人 ${speaker.participant_number} · ${speakerName(speaker)}`
+      : "我",
+  });
   asrText.value = "";
   scrollLog();
   return content;
 }
 
 // Send recognized text to the LLM and show + speak the reply.
-async function sendToLLM(text, { userMessageAdded = false } = {}) {
-  let content = (text || "").trim();
-  if (!content) return;
+async function sendToLLM(turnId, speaker) {
+  if (!turnId) return;
   error.value = "";
   sending.value = true;
-  if (!userMessageAdded) content = appendUserMessage(content);
   const chatStartedAt = performance.now();
   try {
     const sid = await ensureSession();
-    const result = await chat(sid, content);
+    const result = await chat(sid, turnId);
     const reply = result.reply;
     console.info(`[Voice timing] Hermes ${Math.round(performance.now() - chatStartedAt)}ms`);
     updateActive(result);
@@ -241,164 +242,57 @@ async function sendToLLM(text, { userMessageAdded = false } = {}) {
   }
 }
 
-async function stopPipeline() {
-  try {
-    if (processor) {
-      processor.disconnect();
-      processor.onaudioprocess = null;
-    }
-    if (source) source.disconnect();
-    if (audioCtx) await audioCtx.close();
-    if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
-  } catch (_) {}
-  processor = source = audioCtx = mediaStream = null;
-}
-
-async function pump() {
-  if (pushing) return;
-  pushing = true;
-  const chunkSamples = Math.round(TARGET_SR * (CHUNK_MS / 1000));
-  try {
-    while (running && buf.length >= chunkSamples) {
-      const chunk = buf.slice(0, chunkSamples);
-      buf = buf.slice(chunkSamples);
-      const j = await pushChunk(sessionId, chunk);
-      language.value = j.language || "—";
-      asrText.value = j.text || "";
-      scrollAsr();
-    }
-  } catch (err) {
-    error.value = err.message;
-    setStatus("error", "后端错误");
-    running = false;
-  } finally {
-    pushing = false;
-  }
-}
-
-async function startRecording() {
-  if (running) return;
-  // Barge-in: if the assistant is speaking, cut it off before we record, so the
-  // mic doesn't pick up the TTS output.
-  if (playingIndex.value !== -1 || ttsState.value !== "idle") stopSpeak();
-  error.value = "";
-  asrText.value = "";
-  language.value = "—";
-  buf = new Float32Array(0);
-
-  try {
-    setStatus("listening", "启动中…");
-    await ensureSession();
-
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-      video: false,
-    });
-
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    source = audioCtx.createMediaStreamSource(mediaStream);
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-
-    processor.onaudioprocess = (e) => {
-      if (!running) return;
-      const input = e.inputBuffer.getChannelData(0);
-      const resampled = resampleLinear(input, audioCtx.sampleRate, TARGET_SR);
-      buf = concatFloat32(buf, resampled);
-      if (!pushing) pump();
-    };
-
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-
-    // The user may have released the button while the stream was resolving.
-    if (!wantRecording) {
-      await stopPipeline();
-      return;
-    }
-
-    running = true;
-    setStatus("listening", "正在说话…");
-  } catch (err) {
-    error.value = err.message;
-    setStatus("error", "启动失败");
-    running = false;
-    await stopPipeline();
-  }
-}
-
-async function stopRecording() {
-  if (!running) return;
-  running = false;
-  setStatus("finishing", "识别中…");
-  await stopPipeline();
-  try {
-    // Flush any tail audio left in the buffer (pump only sends full 500ms
-    // chunks, so the last partial chunk would otherwise be dropped).
-    while (pushing) await new Promise((r) => setTimeout(r, 50));
-    if (buf.length > 0) {
-      const j = await pushChunk(sessionId, buf);
-      language.value = j.language || "—";
-      asrText.value = j.text || "";
-      buf = new Float32Array(0);
-    }
-    const j = await finishSession(sessionId);
-    language.value = j.language || "—";
-    asrText.value = j.text || "";
-    setStatus("done", "已识别");
-    if (asrText.value.trim()) await sendToLLM(asrText.value);
-  } catch (err) {
-    error.value = err.message;
-    setStatus("error", "收尾失败");
-  } finally {
-    buf = new Float32Array(0);
-    pushing = false;
-  }
-}
-
-// ---- Push-to-talk: press to start, release to finish ----
-function onHoldStart() {
-  if (vadEnabled.value) {
-    // In hands-free mode, VAD already owns the microphone continuously. Pressing
-    // the button is only used as an emergency barge-in to stop playback.
-    if (isSpeaking()) stopSpeak();
-    return;
-  }
-  if (holdActive) return;
-  holdActive = true;
-  wantRecording = true;
-  startRecording();
-}
-function onHoldEnd() {
-  if (vadEnabled.value) return;
-  if (!holdActive) return;
-  holdActive = false;
-  wantRecording = false;
-  stopRecording();
-}
-
 // ---- Hands-free VAD ----
 let vadSegmentActive = false;
-let vadProcessing = false;
-let vadCapturedDuringPlayback = false;
+let vadTurnPromise = null;
+const vadQueue = [];
+let vadQueueRunning = false;
+const MAX_VAD_QUEUE = 4;
 
-async function touchActiveWindow() {
-  try {
-    const sid = await ensureSession();
-    const info = await touchSession(sid);
-    updateActive(info);
-  } catch (_) {}
+async function handleEvaluatedTurn(decision, recognizedText) {
+  applySessionState(decision.session);
+  const identity = decision.speaker;
+  if (identity) {
+    speakerId.value = identity.speaker_id || "";
+    speakerCreated.value = !!identity.created;
+    await addVoiceEvent(identity, recognizedText);
+  }
+  gateNotice.value = decision.reason || "";
+  if (decision.interrupt) stopSpeak();
+  if (!decision.should_reply) {
+    setStatus("idle", decision.interrupt ? "已打断" : "未触发回复");
+    return;
+  }
+
+  const replyText = (decision.reply_text || recognizedText).trim();
+  const participant = participants.value.find(
+    (item) => item.speaker_id === identity?.speaker_id
+  );
+  appendUserMessage(replyText, participant);
+  await sendToLLM(decision.turn_id, participant);
 }
 
-async function handleVadAudio(audio) {
-  if (vadProcessing || !audio?.length) return;
-  const capturedDuringPlayback = vadCapturedDuringPlayback;
-  vadCapturedDuringPlayback = false;
-  vadProcessing = true;
+function queueVadAudio(item) {
+  if (vadQueue.length >= MAX_VAD_QUEUE) {
+    gateNotice.value = "语音处理队列已满，本段未处理";
+    return;
+  }
+  vadQueue.push(item);
+  drainVadQueue();
+}
+
+async function drainVadQueue() {
+  if (vadQueueRunning) return;
+  vadQueueRunning = true;
+  while (vadQueue.length) {
+    const item = vadQueue.shift();
+    await handleVadAudio(item.audio, item.turnPromise);
+  }
+  vadQueueRunning = false;
+}
+
+async function handleVadAudio(audio, turnPromise) {
+  if (!audio?.length) return;
   const turnStartedAt = performance.now();
   let stageStartedAt = turnStartedAt;
   let processingStage = "ASR";
@@ -418,51 +312,19 @@ async function handleVadAudio(audio) {
     asrText.value = asrResult.text || "";
     setStatus("done", "已识别");
     const text = asrText.value.trim();
-    const decisionText = text || kwsResult.keyword || "";
-    if (!decisionText) return;
-    processingStage = "唤醒判断";
+    processingStage = "参与人识别";
     stageStartedAt = performance.now();
-    const decision = await decide(
-      sid,
-      decisionText,
-      "vad",
-      capturedDuringPlayback,
-      kwsResult
+    const turn = await turnPromise;
+    const decision = await evaluateTurn(sid, turn.turn_id, audio, {
+      text,
+      language: asrResult.language || "",
+      kws: kwsResult,
+    });
+    console.info(`[Voice timing] Voice gate ${Math.round(performance.now() - stageStartedAt)}ms`);
+    console.info(
+      `[Voice timing] Turn evaluated ${Math.round(performance.now() - turnStartedAt)}ms after VAD end`
     );
-    console.info(`[Voice timing] Gate ${Math.round(performance.now() - stageStartedAt)}ms`);
-    updateActive(decision);
-    if (decision.interrupt) stopSpeak();
-    if (decision.should_reply) {
-      const replyText = (decision.reply_text || decisionText).trim();
-      appendUserMessage(replyText);
-      console.info(
-        `[Voice timing] User text visible ${Math.round(performance.now() - turnStartedAt)}ms after VAD end`
-      );
-      gateNotice.value = `${decision.reason || ""} · 正在识别声纹`;
-      processingStage = "声纹识别";
-      stageStartedAt = performance.now();
-      try {
-        const identity = await resolveVoiceprint(sid, audio);
-        console.info(`[Voice timing] Voiceprint ${Math.round(performance.now() - stageStartedAt)}ms`);
-        speakerId.value = identity.speaker_id || "";
-        speakerCreated.value = !!identity.created;
-        await addVoiceEvent(identity, text || decisionText);
-        gateNotice.value = identity.created
-          ? `${decision.reason || ""} · 已创建声纹身份 ${speakerId.value.slice(0, 8)}`
-          : `${decision.reason || ""} · 已识别声纹 ${speakerId.value.slice(0, 8)}`;
-      } catch (voiceprintError) {
-        // Voice identity enriches the turn but must not make ASR/chat unusable.
-        speakerId.value = "";
-        speakerCreated.value = false;
-        gateNotice.value = `${decision.reason || ""} · 声纹暂不可用，本次按匿名身份继续`;
-        console.warn("voiceprint resolve failed", voiceprintError);
-      }
-      processingStage = "AI 回复";
-      await sendToLLM(replyText, { userMessageAdded: true });
-    } else {
-      setStatus("idle", decision.interrupt ? "已打断" : "未触发回复");
-      gateNotice.value = decision.reason || "未触发回复";
-    }
+    await handleEvaluatedTurn(decision, text || kwsResult.keyword || "");
   } catch (err) {
     error.value = `${processingStage}失败：${err.message}`;
     if (processingStage === "ASR") {
@@ -470,8 +332,6 @@ async function handleVadAudio(audio) {
       scrollAsr();
     }
     setStatus("error", `${processingStage}失败`);
-  } finally {
-    vadProcessing = false;
   }
 }
 
@@ -480,13 +340,12 @@ async function onVadToggle() {
     try {
       await startVad({
         onSpeechStart: () => {
-          // During playback, do not stop immediately. Record the full utterance,
-          // transcribe it, then only interrupt if text matches an interrupt pattern.
           const duringPlayback = isSpeaking();
-          vadCapturedDuringPlayback = duringPlayback;
           vadSegmentActive = true;
           vadActive.value = true;
-          if (!duringPlayback) touchActiveWindow();
+          vadTurnPromise = ensureSession().then((sid) =>
+            beginTurn(sid, duringPlayback)
+          );
           asrText.value = "";
           language.value = "—";
           setStatus("listening", "正在说话…");
@@ -495,7 +354,9 @@ async function onVadToggle() {
           if (!vadSegmentActive) return;
           vadSegmentActive = false;
           vadActive.value = false;
-          handleVadAudio(audio);
+          const turnPromise = vadTurnPromise;
+          vadTurnPromise = null;
+          queueVadAudio({ audio, turnPromise });
         },
         onFrame: (prob, active, silenceMs, segmentMs) => {
           vadProb.value = prob;
@@ -518,21 +379,34 @@ async function onVadToggle() {
     vadSegmentMs.value = 0;
     stopVad();
     releaseSharedStream();
-    if (!running) setStatus("idle", "未开始");
+    setStatus("idle", "未开始");
   }
 }
 
-// Keyboard hold (Space) mirrors the button for desktop users.
 function onKey(e) {
   const tag = (e.target.tagName || "").toLowerCase();
   if (tag === "input" || tag === "textarea") return;
-  if (e.code === "Space") {
-    e.preventDefault();
-    if (e.type === "keydown" && !e.repeat) onHoldStart();
-    else if (e.type === "keyup") onHoldEnd();
-  } else if (e.code === "Escape") {
+  if (e.code === "Escape") {
     e.preventDefault();
     stopSpeak();
+  }
+}
+
+async function changeMembership(speakerIdToChange, action) {
+  if (!sessionId || memberBusy.value) return;
+  memberBusy.value = speakerIdToChange;
+  try {
+    const state = action === "join"
+      ? await joinParticipant(sessionId, speakerIdToChange)
+      : await removeParticipant(sessionId, speakerIdToChange);
+    applySessionState(state);
+  } catch (err) {
+    error.value = err.message;
+    try {
+      applySessionState(await getSession(sessionId));
+    } catch (_) {}
+  } finally {
+    memberBusy.value = "";
   }
 }
 
@@ -540,7 +414,17 @@ function clearVoiceEvents() {
   voiceEvents.value = [];
 }
 
-function clearAll() {
+async function clearAll() {
+  stopSpeak();
+  if (sessionId) {
+    try {
+      await endSession(sessionId);
+    } catch (_) {}
+  }
+  sessionId = null;
+  participants.value = [];
+  observedSpeakers.value = [];
+  voiceEvents.value = [];
   messages.value = [];
   asrText.value = "";
   language.value = "—";
@@ -568,8 +452,6 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
   window.removeEventListener("keyup", onKey);
   if (activeTimer) window.clearInterval(activeTimer);
-  running = false;
-  stopPipeline();
   stopPlayback();
   stopVad();
   releaseSharedStream();
@@ -590,6 +472,9 @@ onBeforeUnmount(() => {
           <span class="pill" :class="aiActive ? 'listening' : ''">
             {{ aiActive ? `AI 已激活 · ${Math.round(activeRemaining)}s` : "AI 未激活" }}
           </span>
+          <span class="pill" :class="participants.length ? 'listening' : ''">
+            会话参与人 {{ participants.length }} 位
+          </span>
           <span v-if="speakerId" class="pill" :class="speakerCreated ? 'finishing' : 'listening'">
             {{ speakerCreated ? "新声纹" : "已识别" }} · {{ speakerId.slice(0, 8) }}
           </span>
@@ -603,19 +488,11 @@ onBeforeUnmount(() => {
         </div>
       </header>
 
-      <div class="ptt-area">
-        <button
-          class="ptt"
-          :class="{ recording: running }"
-          @pointerdown.prevent="onHoldStart"
-          @pointerup.prevent="onHoldEnd"
-          @pointerleave="onHoldEnd"
-          @pointercancel="onHoldEnd"
-          @contextmenu.prevent
-        >
-          <span class="ptt-icon">{{ running ? "🔴" : vadEnabled ? "👂" : "🎙" }}</span>
-          <span class="ptt-label">{{ running ? "松开结束" : vadEnabled ? "正在监听" : "按住说话" }}</span>
-        </button>
+      <div class="vad-area">
+        <div class="vad-indicator" :class="{ active: vadActive, enabled: vadEnabled }">
+          <span class="vad-icon">{{ vadActive ? "🗣" : vadEnabled ? "👂" : "🎙" }}</span>
+          <span>{{ vadActive ? "检测到说话" : vadEnabled ? "正在监听" : "VAD 已关闭" }}</span>
+        </div>
         <div class="asr-col">
           <textarea
             ref="asrEl"
@@ -626,7 +503,7 @@ onBeforeUnmount(() => {
             placeholder="实时识别内容会显示在这里…"
           ></textarea>
           <div class="hint">
-            {{ vadEnabled ? "免手持模式会持续监听麦克风 · 说话自动识别，停顿后自动回复" : "按住说话，松开即识别并回复 · 播放中按住可打断 · 键盘长按空格" }}
+            {{ vadEnabled ? "持续监听麦克风 · 说话自动识别，停顿后自动处理" : "打开下方 VAD 开关后即可开始免手持语音会话" }}
           </div>
         </div>
       </div>
@@ -639,7 +516,7 @@ onBeforeUnmount(() => {
         </label>
         <label class="toggle" title="免手持：检测到说话自动开始录音，停顿自动结束。外放时 TTS 可能被误识别，建议戴耳机。">
           <input type="checkbox" v-model="vadEnabled" @change="onVadToggle" />
-          免手持语音（Silero VAD）
+          Silero VAD 语音监听
         </label>
         <span v-if="vadEnabled" class="pill warn">建议戴耳机</span>
         <span v-if="vadEnabled" class="pill" :class="vadActive ? 'listening' : ''">
@@ -653,10 +530,10 @@ onBeforeUnmount(() => {
         <div class="panel-title">对话</div>
         <div id="log" ref="logEl">
           <div v-if="!messages.length" class="empty">
-            开启免手持模式或按住说话，识别到的声纹会同步显示在右侧。
+            说出唤醒词后，第一位说话者会加入会话；其他声音可在右侧手动加入。
           </div>
           <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
-            <span class="who">{{ m.role === "user" ? "我" : "她" }}</span>
+            <span class="who">{{ m.role === "user" ? (m.speakerLabel || "参与人") : "她" }}</span>
             <span class="body">{{ m.content }}</span>
             <button
               v-if="m.role === 'assistant'"
@@ -678,50 +555,98 @@ onBeforeUnmount(() => {
     <aside class="card voice-sidebar">
       <header class="sidebar-header">
         <div>
-          <h2>声纹识别记录</h2>
-          <p>本次页面会话</p>
+          <h2>会话参与人</h2>
+          <p>唤醒者自动加入，其他声音需手动加入</p>
         </div>
-        <button class="ghost-button" :disabled="!voiceEvents.length" @click="clearVoiceEvents">清空</button>
+        <button class="ghost-button" @click="clearAll">结束会话</button>
       </header>
 
       <div class="voice-summary">
         <div class="summary-item">
-          <strong>{{ distinctSpeakers }}</strong>
-          <span>不同声音</span>
+          <strong>{{ participants.length }}</strong>
+          <span>已加入</span>
         </div>
         <div class="summary-item">
-          <strong>{{ voiceEvents.length }}</strong>
-          <span>识别次数</span>
+          <strong>{{ observedSpeakers.length }}</strong>
+          <span>侦听到</span>
         </div>
       </div>
 
-      <div ref="voiceLogEl" class="voice-log">
-        <div v-if="!voiceEvents.length" class="voice-empty">
-          <span class="voice-empty-icon">◎</span>
-          <strong>等待声纹</strong>
-          <span>完成一次有效唤醒后，这里会显示声音 ID 和识别内容。</span>
-        </div>
-        <article
-          v-for="event in [...voiceEvents].reverse()"
-          :key="event.id"
-          class="voice-event"
-          :style="{ '--speaker-color': speakerColor(event.speakerId) }"
-        >
-          <div class="voice-event-head">
-            <div class="speaker-mark">
-              <span class="speaker-dot"></span>
-              <span>声纹 {{ event.speakerId.slice(0, 8) }}</span>
+      <div class="member-sections">
+        <section class="member-section">
+          <h3>已加入会话</h3>
+          <div v-if="!participants.length" class="member-empty">等待第一位用户说出唤醒词</div>
+          <article
+            v-for="member in participants"
+            :key="member.speaker_id"
+            class="member-card participant-card"
+            :style="{ '--speaker-color': speakerColor(member.speaker_id) }"
+          >
+            <div class="member-head">
+              <div>
+                <strong>参与人 {{ member.participant_number }} · {{ speakerName(member) }}</strong>
+                <small>{{ member.speaker_id.slice(0, 8) }} · {{ member.joined_by === 'manual' ? '手动加入' : '自动加入' }}</small>
+              </div>
+              <button
+                class="member-action danger"
+                :disabled="memberBusy === member.speaker_id"
+                @click="changeMembership(member.speaker_id, 'remove')"
+              >踢出</button>
             </div>
-            <time>{{ event.time }}</time>
-          </div>
-          <code class="speaker-full-id">{{ event.speakerId }}</code>
-          <p class="voice-text">{{ event.text }}</p>
-          <div class="voice-meta">
-            <span>{{ event.created ? "首次识别 · 已建档" : "已有声纹" }}</span>
-            <span>相似度 {{ formatScore(event.score) }}</span>
-          </div>
-        </article>
+            <div class="voice-meta">
+              <span>发言 {{ member.turn_count }} 次</span>
+              <span>相似度 {{ formatScore(member.last_score) }}</span>
+            </div>
+          </article>
+        </section>
+
+        <section class="member-section observed-section">
+          <h3>侦听到的声音</h3>
+          <div v-if="!observedSpeakers.length" class="member-empty">激活期间听到的新声纹会出现在这里</div>
+          <article
+            v-for="speaker in observedSpeakers"
+            :key="speaker.speaker_id"
+            class="member-card observed-card"
+            :style="{ '--speaker-color': speakerColor(speaker.speaker_id) }"
+          >
+            <div class="member-head">
+              <div>
+                <strong>{{ speakerName(speaker) }}</strong>
+                <small>{{ speaker.speaker_id.slice(0, 8) }} · 侦听 {{ speaker.observation_count }} 次</small>
+              </div>
+              <button
+                class="member-action join"
+                :disabled="memberBusy === speaker.speaker_id"
+                @click="changeMembership(speaker.speaker_id, 'join')"
+              >加入</button>
+            </div>
+            <p class="voice-text">{{ speaker.last_text || '（无识别文本）' }}</p>
+            <div class="voice-meta">
+              <span>{{ speaker.created ? '新声纹' : '已有声纹' }}</span>
+              <span>相似度 {{ formatScore(speaker.last_score) }}</span>
+            </div>
+          </article>
+        </section>
       </div>
+
+      <details class="history-details">
+        <summary>声纹识别记录（{{ voiceEvents.length }}）</summary>
+        <button class="ghost-button" :disabled="!voiceEvents.length" @click="clearVoiceEvents">清空记录</button>
+        <div ref="voiceLogEl" class="voice-log compact">
+          <article
+            v-for="event in [...voiceEvents].reverse()"
+            :key="event.id"
+            class="voice-event"
+            :style="{ '--speaker-color': speakerColor(event.speakerId) }"
+          >
+            <div class="voice-event-head">
+              <div class="speaker-mark"><span class="speaker-dot"></span><span>声纹 {{ event.speakerId.slice(0, 8) }}</span></div>
+              <time>{{ event.time }}</time>
+            </div>
+            <p class="voice-text">{{ event.text }}</p>
+          </article>
+        </div>
+      </details>
     </aside>
   </div>
 </template>
@@ -820,46 +745,41 @@ button:disabled {
   border-color: rgba(225, 29, 72, 0.35);
   background: rgba(225, 29, 72, 0.1);
 }
-.ptt-area {
+.vad-area {
   display: flex;
   align-items: center;
   gap: 16px;
   padding: 4px 0;
 }
-.ptt {
+.vad-indicator {
   flex: none;
   display: inline-flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: 5px;
   width: 110px;
   height: 110px;
   border-radius: 50%;
-  border: 2px solid rgba(5, 150, 105, 0.35);
+  border: 2px solid #cbd5e1;
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+  text-align: center;
+}
+.vad-indicator.enabled {
+  border-color: rgba(5, 150, 105, 0.35);
   background: rgba(5, 150, 105, 0.1);
   color: #065f46;
-  font-weight: 800;
-  user-select: none;
-  touch-action: none;
-  transition: transform 0.08s ease, background 0.15s ease;
 }
-.ptt:hover {
-  background: rgba(5, 150, 105, 0.16);
-}
-.ptt:active {
-  transform: scale(0.97);
-}
-.ptt.recording {
+.vad-indicator.active {
   border-color: rgba(225, 29, 72, 0.5);
   background: rgba(225, 29, 72, 0.12);
   color: #9f1239;
 }
-.ptt-icon {
+.vad-icon {
   font-size: 30px;
-}
-.ptt-label {
-  font-size: 13px;
 }
 .asr-col {
   flex: 1;
@@ -984,6 +904,92 @@ button:disabled {
 .playbtn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+.member-sections {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.member-section h3 {
+  margin: 0 0 9px;
+  font-size: 13px;
+  color: #475569;
+}
+.member-empty {
+  padding: 16px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 12px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 12px;
+}
+.member-card {
+  position: relative;
+  margin-bottom: 9px;
+  padding: 12px 12px 10px 15px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #fff;
+  overflow: hidden;
+}
+.member-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: var(--speaker-color);
+}
+.member-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.member-head strong,
+.member-head small {
+  display: block;
+}
+.member-head strong {
+  color: #334155;
+  font-size: 13px;
+}
+.member-head small {
+  margin-top: 4px;
+  color: #94a3b8;
+  font-size: 10px;
+}
+.member-action {
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 11px;
+}
+.member-action.join {
+  color: #065f46;
+  border-color: rgba(5, 150, 105, 0.3);
+  background: rgba(5, 150, 105, 0.08);
+}
+.member-action.danger {
+  color: #9f1239;
+  border-color: rgba(225, 29, 72, 0.25);
+  background: rgba(225, 29, 72, 0.06);
+}
+.history-details {
+  border-top: 1px solid #e2e8f0;
+  padding: 12px 14px;
+  color: #64748b;
+  font-size: 12px;
+}
+.history-details summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+.voice-log.compact {
+  max-height: 220px;
+  padding: 10px 0 0;
 }
 .voice-sidebar {
   display: flex;
@@ -1173,10 +1179,10 @@ button:disabled {
     padding: 12px;
     border-radius: 12px;
   }
-  .ptt-area {
+  .vad-area {
     align-items: stretch;
   }
-  .ptt {
+  .vad-indicator {
     width: 86px;
     height: 86px;
   }

@@ -1,45 +1,80 @@
 // Client for the backend voice-chat API.
-//
-// Backend endpoints (see backend/main.py):
-//   POST /api/session/start   -> { session_id, asr_session_id }
-//   POST /api/chunk?session_id=<id>   body: raw float32 PCM @16k mono -> {language, text}
-//   POST /api/finish?session_id=<id>  -> {language, text}
-//   POST /api/chat  {session_id, text} -> {reply}
 
 const BASE = "/api";
 
-export async function startSession() {
-  const r = await fetch(`${BASE}/session/start`, { method: "POST" });
-  if (!r.ok) throw new Error(`start failed: ${r.status} ${await r.text()}`);
-  const j = await r.json();
-  if (!j.session_id) throw new Error("start returned no session_id");
-  return j.session_id;
+async function jsonResponse(response, label) {
+  if (!response.ok) throw new Error(`${label} failed: ${response.status} ${await response.text()}`);
+  return await response.json();
 }
 
-export async function pushChunk(sessionId, float32_16k) {
-  const r = await fetch(
-    `${BASE}/chunk?session_id=${encodeURIComponent(sessionId)}`,
+export async function startSession() {
+  const response = await fetch(`${BASE}/session/start`, { method: "POST" });
+  return await jsonResponse(response, "start");
+}
+
+export async function getSession(sessionId) {
+  const response = await fetch(`${BASE}/session/${encodeURIComponent(sessionId)}`);
+  return await jsonResponse(response, "session state");
+}
+
+export async function endSession(sessionId) {
+  const response = await fetch(`${BASE}/session/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) throw new Error(`end session failed: ${response.status} ${await response.text()}`);
+}
+
+export async function beginTurn(sessionId, assistantSpeaking = false) {
+  const response = await fetch(
+    `${BASE}/session/${encodeURIComponent(sessionId)}/turns`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: float32_16k.buffer,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "vad", assistant_speaking: assistantSpeaking }),
     }
   );
-  if (!r.ok) throw new Error(`chunk failed: ${r.status} ${await r.text()}`);
-  return await r.json();
+  return await jsonResponse(response, "begin turn");
 }
 
-export async function finishSession(sessionId) {
-  const r = await fetch(
-    `${BASE}/finish?session_id=${encodeURIComponent(sessionId)}`,
+export async function evaluateTurn(sessionId, turnId, float32_16k, metadata = {}) {
+  const form = new FormData();
+  form.append(
+    "audio",
+    new Blob([float32_16k.buffer], { type: "application/octet-stream" }),
+    "utterance.pcm"
+  );
+  form.append("text", metadata.text || "");
+  form.append("language", metadata.language || "");
+  form.append("kws_detected", metadata.kws?.detected ? "true" : "false");
+  if (metadata.kws?.keyword) form.append("kws_keyword", metadata.kws.keyword);
+  if (metadata.kws?.available !== undefined) {
+    form.append("kws_available", metadata.kws.available ? "true" : "false");
+  }
+  const response = await fetch(
+    `${BASE}/session/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/evaluate`,
+    { method: "POST", body: form }
+  );
+  return await jsonResponse(response, "evaluate turn");
+}
+
+export async function joinParticipant(sessionId, speakerId) {
+  const response = await fetch(
+    `${BASE}/session/${encodeURIComponent(sessionId)}/participants/${encodeURIComponent(speakerId)}`,
     { method: "POST" }
   );
-  if (!r.ok) throw new Error(`finish failed: ${r.status} ${await r.text()}`);
-  return await r.json();
+  return await jsonResponse(response, "join participant");
+}
+
+export async function removeParticipant(sessionId, speakerId) {
+  const response = await fetch(
+    `${BASE}/session/${encodeURIComponent(sessionId)}/participants/${encodeURIComponent(speakerId)}`,
+    { method: "DELETE" }
+  );
+  return await jsonResponse(response, "remove participant");
 }
 
 export async function transcribeUtterance(sessionId, float32_16k) {
-  const r = await fetch(
+  const response = await fetch(
     `${BASE}/transcribe?session_id=${encodeURIComponent(sessionId)}`,
     {
       method: "POST",
@@ -47,89 +82,32 @@ export async function transcribeUtterance(sessionId, float32_16k) {
       body: float32_16k.buffer,
     }
   );
-  if (!r.ok) throw new Error(`transcribe failed: ${r.status} ${await r.text()}`);
-  return await r.json();
+  return await jsonResponse(response, "transcribe");
 }
 
 export async function detectKeyword(float32_16k) {
-  const r = await fetch(`${BASE}/kws/detect`, {
+  const response = await fetch(`${BASE}/kws/detect`, {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream" },
     body: float32_16k.buffer,
   });
-  if (!r.ok) throw new Error(`KWS detect failed: ${r.status} ${await r.text()}`);
-  return await r.json();
-}
-
-export async function resolveVoiceprint(sessionId, float32_16k) {
-  const r = await fetch(
-    `${BASE}/voiceprint/resolve?session_id=${encodeURIComponent(sessionId)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: float32_16k.buffer,
-    }
-  );
-  if (!r.ok) throw new Error(`voiceprint resolve failed: ${r.status} ${await r.text()}`);
-  return await r.json();
-}
-
-export async function decide(
-  sessionId,
-  text,
-  source = "vad",
-  assistantSpeaking = false,
-  kws = null
-) {
-  const r = await fetch(`${BASE}/decide`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session_id: sessionId,
-      text,
-      source,
-      assistant_speaking: assistantSpeaking,
-      kws_detected: !!kws?.detected,
-      kws_keyword: kws?.keyword || null,
-      kws_available: kws?.available ?? null,
-    }),
-  });
-  if (!r.ok) throw new Error(`decide failed: ${r.status} ${await r.text()}`);
-  return await r.json();
+  return await jsonResponse(response, "KWS detect");
 }
 
 export async function touchSession(sessionId, { seconds = null, force = false } = {}) {
-  const r = await fetch(`${BASE}/touch`, {
+  const response = await fetch(`${BASE}/touch`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId, seconds, force }),
   });
-  if (!r.ok) throw new Error(`touch failed: ${r.status} ${await r.text()}`);
-  return await r.json();
+  return await jsonResponse(response, "touch");
 }
 
-export async function chat(sessionId, text) {
-  const r = await fetch(`${BASE}/chat`, {
+export async function chat(sessionId, turnId) {
+  const response = await fetch(`${BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, text }),
+    body: JSON.stringify({ session_id: sessionId, turn_id: turnId }),
   });
-  if (!r.ok) throw new Error(`chat failed: ${r.status} ${await r.text()}`);
-  return await r.json();
-}
-
-// Linear resample a Float32Array from srcSr to dstSr.
-export function resampleLinear(input, srcSr, dstSr) {
-  if (srcSr === dstSr) return input;
-  const ratio = dstSr / srcSr;
-  const outLen = Math.max(0, Math.round(input.length * ratio));
-  const out = new Float32Array(outLen);
-  for (let i = 0; i < outLen; i++) {
-    const x = i / ratio;
-    const x0 = Math.floor(x);
-    const x1 = Math.min(x0 + 1, input.length - 1);
-    const t = x - x0;
-    out[i] = input[x0] * (1 - t) + input[x1] * t;
-  }
-  return out;
+  return await jsonResponse(response, "chat");
 }
