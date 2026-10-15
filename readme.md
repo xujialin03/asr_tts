@@ -11,7 +11,7 @@
 - 🔔 **关键词唤醒**：冷启动时由 sherpa-onnx 声学 KWS 或 ASR 文本唤醒词激活助手；KWS 不可用时可降级为文本唤醒。
 - 💬 **连续对话**：激活后在配置的时间窗口内无需重复唤醒，TTS 播放期间会自动延长窗口。
 - ✋ **语音打断**：AI 播放期间先完成 ASR，再根据打断词确认是否停止播放，减少环境声音造成的误打断。
-- 🧠 **Hermes 对话**：项目专用 Hermes agent 管理助理人设、上下文和对话历史。
+- 🧠 **Hermes 对话**：项目专用 Hermes agent 管理助理人设、上下文和对话历史，并为每条回复输出适配内容的 TTS 语气指令。
 - 🔊 **流式语音回复**：Breeze-TTS-2 返回裸 PCM，浏览器边接收边播放；支持自动朗读、单条重播和停止播放。
 - 🗣️ **声纹识别**：有效唤醒后由 CAM++ 匹配已有身份，或自动创建匿名 `speaker_id`。
 - 📋 **声纹记录**：页面侧栏展示本次会话识别到的声音数量、声纹 ID、识别文本、相似度和建档状态。
@@ -97,7 +97,7 @@ cp .env.example .env
 - `database.postgresql`：项目使用的 PostgreSQL 连接信息
 - `assistant`：唤醒词、连续对话窗口和打断正则
 - `hermes`：Hermes client 路径和超时时间
-- `tts`：音色提示词、参考音频及其文本
+- `tts`：Hermes 未返回动态语气时的兜底提示词、`cfg_scale`、参考音频及其文本
 
 后端默认读取仓库根目录的 `config.yaml`；可以通过 `CONFIG_PATH` 环境变量指定其他路径。`tts.ref_audio` 的相对路径以 `backend/` 为基准。
 
@@ -223,7 +223,7 @@ FastAPI 后端还提供声纹用户和模板管理代理接口，详细契约见
 ## 上游音频协议
 
 - ASR 输入：little-endian float32 PCM、16kHz、单声道；流式模式通常每 500ms 推送一个 chunk。
-- TTS 请求：后端以 `multipart/form-data` 调用 `/v1/audio/speech`，可附带 `instruction`、`ref_audio` 和 `ref_text`。
+- TTS 请求：Hermes 每轮返回 `text` 和动态 `instruction`；后端以 `multipart/form-data` 调用 `/v1/audio/speech`，并附带 `instruction`、配置的 `cfg_scale`、`ref_audio` 和 `ref_text`。Hermes 未返回有效 `instruction` 时回退到 `tts.prompt`。
 - TTS 响应：`audio/pcm` 裸 PCM、16-bit、单声道，采样率由上游 `/health` 返回（当前默认 24000Hz）；后端通过 `X-Sample-Rate` 响应头传给前端。
 - Breeze-TTS-2 上游只支持单并发，后端通过锁避免同时发起多个合成请求。
 

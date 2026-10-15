@@ -34,9 +34,10 @@ export function stopPlayback() {
 
 /**
  * Fetch /api/tts for `text` and stream-play the PCM.
+ * `instruction` is the per-reply voice direction produced by Hermes.
  * @returns {Promise<void>} resolves when playback finishes (or is cancelled).
  */
-export async function playTts(text, { onState, onDuration } = {}) {
+export async function playTts(text, { instruction = "", onState, onDuration } = {}) {
   stopPlayback();
 
   const handle = { cancelled: false, sources: [], abort: new AbortController(), reader: null };
@@ -52,7 +53,7 @@ export async function playTts(text, { onState, onDuration } = {}) {
     const res = await fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, instruction }),
       signal: handle.abort.signal,
     });
     if (!res.ok) throw new Error(`tts failed: ${res.status} ${await res.text()}`);

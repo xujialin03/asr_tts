@@ -20,7 +20,7 @@ Qwen3-ASR
              Web Audio 流式播放
 ```
 
-前端负责麦克风、VAD、播放和用户交互；FastAPI 后端负责本地 Session、门控状态和远程服务代理。项目专用 Hermes agent 独占管理助理人设、对话上下文和历史，backend 不保存或同步对话历史。
+前端负责麦克风、VAD、播放和用户交互；FastAPI 后端负责本地 Session、门控状态和远程服务代理。项目专用 Hermes agent 独占管理助理人设、对话上下文和历史，backend 不保存或同步对话历史。Hermes 的最终响应使用 `{"text":"...","instruction":"..."}`：`text` 用于页面展示和朗读，`instruction` 作为本轮动态 Voice Direction 传给 TTS；解析失败时兼容旧的纯文本回复。
 
 ## 2. 输入模式
 
@@ -267,7 +267,7 @@ Breeze-TTS-2 的参考音频要求：
 - 单一说话人；
 - `ref_text` 与参考音频逐字一致。
 
-当前模式属于 Voice Direction：参考音频锁定说话人身份，`instruction` 控制语气、速度和情绪。官方建议 `cfg_scale=4` 增强 instruction 遵循度。
+当前模式属于 Voice Direction：参考音频锁定说话人身份，Hermes 为每条回复生成的 `instruction` 控制语气、速度和情绪。该值沿 `/api/chat` → 前端消息 → `/api/tts` 传递；缺失时回退到 `config.yaml` 的 `tts.prompt`。`cfg_scale` 由 `tts.cfg_scale` 配置，默认使用官方建议值 `4` 以增强 instruction 遵循度。
 
 ## 8. Session 管理
 

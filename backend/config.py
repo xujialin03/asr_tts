@@ -76,6 +76,7 @@ INTERRUPT_PATTERNS = [
 
 _tts = _cfg.get("tts", {})
 TTS_PROMPT = _tts.get("prompt", "")
+TTS_CFG_SCALE = max(1.0, min(float(_tts.get("cfg_scale", 4)), 10.0))
 TTS_REF_TEXT = _tts.get("ref_text", "")
 
 # ref_audio is stored relative to the backend dir (e.g. assets/ref_voice.wav).

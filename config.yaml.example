@@ -48,12 +48,15 @@ assistant:
 
 hermes:
   # Client for the dedicated Hermes agent. Hermes owns conversation history
-  # and persona; the backend sends only the current user utterance.
+  # and persona; the backend also injects a per-turn JSON voice-output contract.
   client_path: ~/worker_agent_client.py
   timeout_seconds: 180
 
 tts:
-  prompt: "音色/语气提示词"
+  # Hermes 会为每条回复生成动态 instruction；prompt 仅在 Hermes 未返回时作为兜底。
+  prompt: "用温柔、自然、亲切的语气表达，语速适中。"
+  # instruction 遵循强度；Breeze-TTS-2 Voice Direction 推荐使用 4。
+  cfg_scale: 4
   # 固定参考音频（zero-shot 音色克隆），用于锁定音色。路径相对 backend/ 目录。
   # ref_text 是参考音频对应的文字，可用 ASR 服务转写得到。
   ref_audio: assets/ref_voice.wav

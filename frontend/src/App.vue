@@ -23,7 +23,7 @@ const status = ref("idle"); // idle | listening | finishing | error | done
 const statusText = ref("未开始");
 const language = ref("—");
 const asrText = ref(""); // live ASR recognition
-const messages = ref([]); // {role, content} conversation
+const messages = ref([]); // {role, content, ttsInstruction?} conversation
 const sending = ref(false);
 const error = ref("");
 const gateNotice = ref("");
@@ -182,6 +182,7 @@ async function speak(index) {
   extendActiveForPlayback(0, true);
   try {
     await playTts(msg.content, {
+      instruction: msg.ttsInstruction || "",
       onState: (s) => {
         ttsState.value = s;
       },
@@ -225,7 +226,11 @@ async function sendToLLM(text, { userMessageAdded = false } = {}) {
     const reply = result.reply;
     console.info(`[Voice timing] Hermes ${Math.round(performance.now() - chatStartedAt)}ms`);
     updateActive(result);
-    messages.value.push({ role: "assistant", content: reply });
+    messages.value.push({
+      role: "assistant",
+      content: reply,
+      ttsInstruction: result.tts_instruction || "",
+    });
     scrollLog();
     if (autoPlay.value) speak(messages.value.length - 1);
   } catch (err) {

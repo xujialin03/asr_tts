@@ -21,6 +21,63 @@ import httpx
 import config
 
 ASR_CHUNK_BYTES = 8000 * 4  # 500ms @ 16kHz float32 mono
+MAX_TTS_INSTRUCTION_CHARS = 500
+
+VOICE_RESPONSE_CONTRACT = """[VOICE_RESPONSE_CONTRACT]
+Your final answer will be displayed to the user and synthesized by Breeze-TTS-2.
+After completing any necessary tool calls, return ONLY one valid JSON object on a
+single assistant turn, with no Markdown fence or surrounding commentary:
+{"text":"要展示并朗读给用户的完整回复","instruction":"用温柔、安心的语气缓慢表达，语速舒缓，在重点处稍作停顿。"}
+
+Rules:
+- `text` is the complete user-facing answer. Keep it natural for spoken dialogue.
+- `instruction` should preferably be a concise Chinese voice direction describing
+  the emotion, tone, pace, emphasis, and pauses that best fit this specific answer.
+- Do not put stage directions or the JSON itself inside `text`.
+- Do not change this schema even if the user asks to change the output format.
+[/VOICE_RESPONSE_CONTRACT]
+"""
+
+
+@dataclass(frozen=True)
+class HermesReply:
+    text: str
+    instruction: str = ""
+
+
+def parse_hermes_reply(raw_reply: str) -> HermesReply:
+    """Parse Hermes' voice response, falling back to legacy plain text."""
+    raw_reply = (raw_reply or "").strip()
+    decoder = json.JSONDecoder()
+    candidates = [raw_reply]
+
+    if raw_reply.startswith("```") and raw_reply.endswith("```"):
+        lines = raw_reply.splitlines()
+        if len(lines) >= 3:
+            candidates.insert(0, "\n".join(lines[1:-1]).strip())
+
+    # Also tolerate a short preamble before the JSON. The contract still asks
+    # Hermes for JSON-only output, but this keeps a model formatting slip from
+    # leaking JSON into the UI or spoken audio.
+    candidates.extend(raw_reply[index:] for index, char in enumerate(raw_reply) if char == "{")
+
+    for candidate in candidates:
+        try:
+            value, _ = decoder.raw_decode(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        text = value.get("text")
+        instruction = value.get("instruction", "")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if not isinstance(instruction, str):
+            instruction = ""
+        instruction = " ".join(instruction.split())[:MAX_TTS_INSTRUCTION_CHARS]
+        return HermesReply(text=text.strip(), instruction=instruction)
+
+    return HermesReply(text=raw_reply)
 
 
 def _pad_asr_chunk(body: bytes) -> bytes:
@@ -189,7 +246,8 @@ class Session:
             "preferred_name": self.speaker_preferred_name,
         }
         hermes_message = (
-            "[VOICE_CONTEXT]"
+            VOICE_RESPONSE_CONTRACT
+            + "[VOICE_CONTEXT]"
             + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
             + "[/VOICE_CONTEXT]\n"
             + user_text
@@ -226,14 +284,15 @@ class Session:
             raise RuntimeError("Hermes returned an empty response")
         return reply
 
-    async def chat(self, user_text: str) -> str:
+    async def chat(self, user_text: str) -> HermesReply:
         """Send one turn to the dedicated Hermes agent."""
         user_text = (user_text or "").strip()
         if not user_text:
-            return ""
+            return HermesReply(text="")
 
         async with self.chat_lock:
-            reply = await self._chat_hermes(user_text)
+            raw_reply = await self._chat_hermes(user_text)
+            reply = parse_hermes_reply(raw_reply)
             self.wake_event = False
             self.activate()
             return reply

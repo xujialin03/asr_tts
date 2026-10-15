@@ -8,7 +8,7 @@ Frontend flow:
   POST /api/session/start   -> create local interaction session -> {session_id}
   POST /api/chunk           -> stream float32 PCM to ASR        -> {language, text}
   POST /api/finish          -> finish ASR                       -> {language, text}
-  POST /api/chat            -> send text to Hermes              -> {reply}
+  POST /api/chat            -> send text to Hermes              -> {reply, tts_instruction}
   POST /api/tts             -> synthesize speech (streaming PCM)
 """
 
@@ -23,7 +23,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import config
 from session import ASR_CHUNK_BYTES, sessions
@@ -440,7 +440,8 @@ async def chat(req: ChatReq) -> JSONResponse:
         raise HTTPException(status_code=502, detail=f"Hermes call failed: {e}")
     return JSONResponse(
         {
-            "reply": reply,
+            "reply": reply.text,
+            "tts_instruction": reply.instruction,
             "speaker_id": s.speaker_id,
             "active": s.is_active(),
             "active_remaining": round(s.active_remaining(), 1),
@@ -451,6 +452,7 @@ async def chat(req: ChatReq) -> JSONResponse:
 # ---- TTS (streaming PCM) ----
 class TtsReq(BaseModel):
     text: str
+    instruction: str | None = Field(default=None, max_length=500)
 
 
 @app.post("/api/tts")
@@ -471,9 +473,10 @@ async def tts(req: TtsReq) -> StreamingResponse:
         logger.warning("TTS request #%s rejected: empty text", request_id)
         raise HTTPException(status_code=400, detail="text required")
 
-    form = {"text": text}
-    if config.TTS_PROMPT:
-        form["instruction"] = config.TTS_PROMPT
+    form = {"text": text, "cfg_scale": str(config.TTS_CFG_SCALE)}
+    instruction = (req.instruction or "").strip() or config.TTS_PROMPT
+    if instruction:
+        form["instruction"] = instruction
 
     # Attach the fixed reference audio + its transcript so the cloned voice
     # stays consistent across every request.
