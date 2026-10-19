@@ -43,6 +43,7 @@ export async function playTts(text, { instruction = "", onState, onDuration } = 
   const handle = { cancelled: false, sources: [], abort: new AbortController(), reader: null };
   current = handle;
 
+  const startedAt = performance.now();
   const ac = audioCtx();
   if (ac.state === "suspended") await ac.resume();
 
@@ -58,7 +59,9 @@ export async function playTts(text, { instruction = "", onState, onDuration } = 
     });
     if (!res.ok) throw new Error(`tts failed: ${res.status} ${await res.text()}`);
     const requestId = res.headers.get("X-TTS-Request-ID") || "?";
-    console.info(`[TTS #${requestId}] response accepted`);
+    console.info(
+      `[Voice timing] TTS #${requestId} headers ${Math.round(performance.now() - startedAt)}ms`
+    );
 
     const sampleRate = parseInt(res.headers.get("X-Sample-Rate") || "24000", 10);
     const reader = res.body.getReader();
@@ -109,6 +112,9 @@ export async function playTts(text, { instruction = "", onState, onDuration } = 
 
       if (!firstScheduled) {
         firstScheduled = true;
+        console.info(
+          `[Voice timing] TTS #${requestId} first-chunk ${Math.round(performance.now() - startedAt)}ms`
+        );
         state("playing");
       }
     }

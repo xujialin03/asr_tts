@@ -123,6 +123,25 @@ def test_manual_join_allows_next_turn_and_kick_blocks_it():
     assert "b" in session.observed_speakers
 
 
+def test_manual_join_opens_window_after_first_waker_expires():
+    # Real-world flow: participant 1 wakes and replies, then their activation
+    # window expires before participant 2 is observed, manually joined, and
+    # speaks. Joining must open a fresh window so participant 2 does not have
+    # to repeat the wake word.
+    session = Session(id="s")
+    evaluate(session, "a", "志玲你好", active=False)
+    evaluate(session, "b", "我也想聊", active=True)  # observed, no window extension
+
+    session.active_until = 0  # first waker's window has expired by now
+    session.add_participant("b")
+    assert session.is_active() is True
+
+    turn = evaluate(session, "b", "现在轮到我了吗")
+    assert turn.should_reply is True
+    assert turn.participant_number == 2
+    assert turn.reason == "参与人在连续对话窗口内"
+
+
 def test_stranger_cannot_interrupt_playback():
     session = Session(id="s")
     evaluate(session, "a", "志玲你好", active=False)

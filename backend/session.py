@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
 import sys
 import time
@@ -12,6 +13,8 @@ from dataclasses import dataclass, field
 import httpx
 
 import config
+
+logger = logging.getLogger(__name__)
 
 ASR_CHUNK_BYTES = 8000 * 4  # 500ms @ 16kHz float32 mono
 MAX_TTS_INSTRUCTION_CHARS = 500
@@ -366,7 +369,13 @@ class Session:
         observed = self.observed_speakers.get(speaker_id)
         if not observed:
             return self.participants.get(speaker_id)
-        return self._add_participant(observed.identity, "manual")
+        participant = self._add_participant(observed.identity, "manual")
+        # A manually added participant should be able to speak on the next turn
+        # without repeating the wake word. Their earlier wake was treated as a
+        # stranger's (no window extension), so open a fresh window now; otherwise
+        # the activation from the first participant may already have expired.
+        self.activate()
+        return participant
 
     def remove_participant(self, speaker_id: str) -> Participant | None:
         participant = self.participants.pop(speaker_id, None)
@@ -559,6 +568,7 @@ class Session:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        spawn_at = time.monotonic()
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(), timeout=config.HERMES_TIMEOUT_SECONDS + 10
@@ -571,6 +581,12 @@ class Session:
                 except asyncio.TimeoutError:
                     pass
             raise
+        logger.info(
+            "Hermes subprocess session=%s turn=%s subprocess=%.2fs",
+            self.id,
+            turn.id,
+            time.monotonic() - spawn_at,
+        )
         if process.returncode != 0:
             detail = stderr.decode(errors="replace").strip()
             raise RuntimeError(detail or f"Hermes client exited with {process.returncode}")
