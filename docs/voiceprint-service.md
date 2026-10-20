@@ -18,19 +18,11 @@
 
 阈值只是初始值，必须用真实麦克风、房间和用户录音校准。普通声纹识别不具备防录音回放或防语音克隆能力，不能单独用于支付、开锁等高风险认证。
 
-## 1. 准备已有 PostgreSQL
+## 1. PostgreSQL
 
-当前 compose 只启动声纹服务，复用本机已运行并暴露 `5432` 的 PostgreSQL。首次使用时，用 PostgreSQL 管理员账号创建项目独立账号和数据库：
+`compose.yaml` 自带专属 PostgreSQL（宿主机端口 5433，避开其他项目的 5432），并在 `.env` 的 `POSTGRES_DB/USER/PASSWORD` 中创建项目独立账号和数据库。声纹服务通过 compose 内部网络直接连到 `postgres:5432`，无需手动建库建表。
 
-```bash
-docker exec -i postgres psql -U root -d postgres \
-  -v app_user=qwen3_asr \
-  -v app_password='替换为随机强密码' \
-  -v app_database=qwen3_asr \
-  < voiceprint-service/migrations/000_create_database.psql
-```
-
-如果容器名或管理员账号不同，请相应替换。服务启动时会幂等执行 `001_initial.sql`，创建 `users` 和 `voiceprints` 表。
+服务启动时会幂等执行 `001_initial.sql`，创建 `users` 和 `voiceprints` 表。
 
 ## 2. 配置与启动
 
@@ -38,7 +30,7 @@ docker exec -i postgres psql -U root -d postgres \
 cp .env.example .env
 ```
 
-修改 `.env` 中连接串的密码，使其与上一步一致，然后：
+在 `.env` 中设置 `POSTGRES_PASSWORD`（需与 `config.yaml` 的 `database.postgresql.password` 一致），然后：
 
 ```bash
 docker compose up -d --build voiceprint

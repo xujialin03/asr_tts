@@ -2,15 +2,13 @@
 import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   startSession,
-  getSession,
   endSession,
   beginTurn,
   evaluateTurn,
-  joinParticipant,
-  removeParticipant,
   transcribeUtterance,
   detectKeyword,
   touchSession,
+  recordPerformance,
   chat,
 } from "./asrClient.js";
 import { playTts, stopPlayback } from "./ttsPlayer.js";
@@ -26,19 +24,21 @@ const messages = ref([]); // {role, content, ttsInstruction?} conversation
 const sending = ref(false);
 const error = ref("");
 const gateNotice = ref("");
+const decisionDebug = ref(null);
 const aiActive = ref(false);
 const activeRemaining = ref(0);
 const speakerId = ref("");
 const speakerCreated = ref(false);
-const participants = ref([]);
-const observedSpeakers = ref([]);
-const memberBusy = ref("");
-const voiceEvents = ref([]); // diagnostic history, not membership state
+const voiceEvents = ref([]); // diagnostic history of recognized voices
 const voiceLogEl = ref(null);
 const logEl = ref(null);
 const asrEl = ref(null);
 
 const autoPlay = ref(true); // auto-speak each assistant reply
+// 声纹识别侧栏暂时隐藏（功能与状态保留，后续在此区域做别的调度界面）。
+const showVoiceSidebar = ref(false);
+// 右侧决策模型调度面板：输入 → 判断 → 结论。
+const showDecisionPanel = ref(true);
 const ttsState = ref("idle"); // idle | synthesizing | playing | done
 const playingIndex = ref(-1); // which message is currently speaking
 const vadEnabled = ref(false); // hands-free Silero VAD (opt-in; headphones recommended)
@@ -94,6 +94,12 @@ async function addVoiceEvent(identity, text) {
 
 let sessionId = null;
 
+function recordTiming(stage, startedAt, { turnId = null, detail = {} } = {}) {
+  if (!sessionId) return;
+  const elapsedMs = performance.now() - startedAt;
+  recordPerformance(sessionId, { stage, elapsed_ms: elapsedMs, turn_id: turnId, detail }).catch(() => {});
+}
+
 function setStatus(s, label) {
   status.value = s;
   statusText.value = label;
@@ -132,8 +138,6 @@ async function ensureSession() {
 
 function applySessionState(state) {
   if (!state) return;
-  participants.value = state.participants || [];
-  observedSpeakers.value = state.observed_speakers || [];
   updateActive(state);
 }
 
@@ -186,6 +190,10 @@ async function speak(index) {
       onDuration: ({ remainingSeconds }) => {
         extendActiveForPlayback(remainingSeconds);
       },
+      onTiming: (stage, elapsedMs, detail) => {
+        if (!sessionId) return;
+        recordPerformance(sessionId, { stage, elapsed_ms: elapsedMs, detail }).catch(() => {});
+      },
     });
   } catch (err) {
     error.value = err.message;
@@ -206,9 +214,7 @@ function appendUserMessage(text, speaker = null) {
   messages.value.push({
     role: "user",
     content,
-    speakerLabel: speaker
-      ? `参与人 ${speaker.participant_number} · ${speakerName(speaker)}`
-      : "我",
+    speakerLabel: speaker ? speakerName(speaker) : "我",
   });
   asrText.value = "";
   scrollLog();
@@ -226,6 +232,7 @@ async function sendToLLM(turnId, speaker) {
     const result = await chat(sid, turnId);
     const reply = result.reply;
     console.info(`[Voice timing] Hermes ${Math.round(performance.now() - chatStartedAt)}ms`);
+    recordTiming("hermes", chatStartedAt, { turnId });
     updateActive(result);
     messages.value.push({
       role: "assistant",
@@ -257,19 +264,40 @@ async function handleEvaluatedTurn(decision, recognizedText) {
     speakerCreated.value = !!identity.created;
     await addVoiceEvent(identity, recognizedText);
   }
-  gateNotice.value = decision.reason || "";
+  gateNotice.value = decision.decision_reason || decision.reason || "";
+  decisionDebug.value = {
+    text: recognizedText,
+    should_reply: decision.should_reply,
+    addressed: decision.is_addressed_to_ai,
+    response_type: decision.response_type,
+    confidence: decision.confidence,
+    decision_reason: decision.decision_reason || "",
+    gate_reason: decision.reason || "",
+    fallback: decision.decision_fallback,
+    wake: decision.wake_event,
+    interrupt: decision.interrupt,
+    speaker_id: identity?.speaker_id || "",
+    speaker_name: identity
+      ? identity.preferred_name || identity.display_name || ""
+      : "",
+    session_active: decision.session?.active ?? null,
+    active_remaining: decision.session?.active_remaining ?? null,
+    at: new Date().toLocaleTimeString(),
+  };
   if (decision.interrupt) stopSpeak();
   if (!decision.should_reply) {
-    setStatus("idle", decision.interrupt ? "已打断" : "未触发回复");
+    const decisionLabel = decision.decision_fallback
+      ? "决策模型异常，已使用传统门控"
+      : decision.response_type === "silent"
+        ? "决策模型判定无需回应"
+        : "未触发回复";
+    setStatus("idle", decision.interrupt ? "已打断" : decisionLabel);
     return;
   }
 
   const replyText = (decision.reply_text || recognizedText).trim();
-  const participant = participants.value.find(
-    (item) => item.speaker_id === identity?.speaker_id
-  );
-  appendUserMessage(replyText, participant);
-  await sendToLLM(decision.turn_id, participant);
+  appendUserMessage(replyText, identity);
+  await sendToLLM(decision.turn_id, identity);
 }
 
 function queueVadAudio(item) {
@@ -308,11 +336,12 @@ async function handleVadAudio(audio, turnPromise) {
       }),
     ]);
     console.info(`[Voice timing] ASR+KWS ${Math.round(performance.now() - stageStartedAt)}ms`);
+    recordTiming("asr_kws", stageStartedAt);
     language.value = asrResult.language || "—";
     asrText.value = asrResult.text || "";
     setStatus("done", "已识别");
     const text = asrText.value.trim();
-    processingStage = "参与人识别";
+    processingStage = "声纹识别";
     stageStartedAt = performance.now();
     const turn = await turnPromise;
     const decision = await evaluateTurn(sid, turn.turn_id, audio, {
@@ -321,6 +350,14 @@ async function handleVadAudio(audio, turnPromise) {
       kws: kwsResult,
     });
     console.info(`[Voice timing] Voice gate ${Math.round(performance.now() - stageStartedAt)}ms`);
+    recordTiming("voice_gate", stageStartedAt, {
+      turnId: turn.turn_id,
+      detail: {
+        shouldRespond: decision.should_reply,
+        responseType: decision.response_type,
+        fallback: decision.decision_fallback,
+      },
+    });
     console.info(
       `[Voice timing] Turn evaluated ${Math.round(performance.now() - turnStartedAt)}ms after VAD end`
     );
@@ -392,24 +429,6 @@ function onKey(e) {
   }
 }
 
-async function changeMembership(speakerIdToChange, action) {
-  if (!sessionId || memberBusy.value) return;
-  memberBusy.value = speakerIdToChange;
-  try {
-    const state = action === "join"
-      ? await joinParticipant(sessionId, speakerIdToChange)
-      : await removeParticipant(sessionId, speakerIdToChange);
-    applySessionState(state);
-  } catch (err) {
-    error.value = err.message;
-    try {
-      applySessionState(await getSession(sessionId));
-    } catch (_) {}
-  } finally {
-    memberBusy.value = "";
-  }
-}
-
 function clearVoiceEvents() {
   voiceEvents.value = [];
 }
@@ -422,8 +441,6 @@ async function clearAll() {
     } catch (_) {}
   }
   sessionId = null;
-  participants.value = [];
-  observedSpeakers.value = [];
   voiceEvents.value = [];
   messages.value = [];
   asrText.value = "";
@@ -459,7 +476,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div class="app-shell" :class="{ 'single-column': !showVoiceSidebar && !showDecisionPanel }">
     <main class="card assistant-card">
       <header class="app-header">
         <div>
@@ -471,9 +488,6 @@ onBeforeUnmount(() => {
           <span class="pill">语言: {{ language }}</span>
           <span class="pill" :class="aiActive ? 'listening' : ''">
             {{ aiActive ? `AI 已激活 · ${Math.round(activeRemaining)}s` : "AI 未激活" }}
-          </span>
-          <span class="pill" :class="participants.length ? 'listening' : ''">
-            会话参与人 {{ participants.length }} 位
           </span>
           <span v-if="speakerId" class="pill" :class="speakerCreated ? 'finishing' : 'listening'">
             {{ speakerCreated ? "新声纹" : "已识别" }} · {{ speakerId.slice(0, 8) }}
@@ -530,10 +544,10 @@ onBeforeUnmount(() => {
         <div class="panel-title">对话</div>
         <div id="log" ref="logEl">
           <div v-if="!messages.length" class="empty">
-            说出唤醒词后，第一位说话者会加入会话；其他声音可在右侧手动加入。
+            开启 VAD 后持续侦听，每段语音都会交给决策模型判断是否回应。
           </div>
           <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
-            <span class="who">{{ m.role === "user" ? (m.speakerLabel || "参与人") : "她" }}</span>
+            <span class="who">{{ m.role === "user" ? (m.speakerLabel || "我") : "她" }}</span>
             <span class="body">{{ m.content }}</span>
             <button
               v-if="m.role === 'assistant'"
@@ -552,82 +566,14 @@ onBeforeUnmount(() => {
       <div v-if="error" class="err">⚠ {{ error }}</div>
     </main>
 
-    <aside class="card voice-sidebar">
+    <aside v-if="showVoiceSidebar" class="card voice-sidebar">
       <header class="sidebar-header">
         <div>
-          <h2>会话参与人</h2>
-          <p>唤醒者自动加入，其他声音需手动加入</p>
+          <h2>声纹识别</h2>
+          <p>开启 VAD 后持续侦听到的声音</p>
         </div>
         <button class="ghost-button" @click="clearAll">结束会话</button>
       </header>
-
-      <div class="voice-summary">
-        <div class="summary-item">
-          <strong>{{ participants.length }}</strong>
-          <span>已加入</span>
-        </div>
-        <div class="summary-item">
-          <strong>{{ observedSpeakers.length }}</strong>
-          <span>侦听到</span>
-        </div>
-      </div>
-
-      <div class="member-sections">
-        <section class="member-section">
-          <h3>已加入会话</h3>
-          <div v-if="!participants.length" class="member-empty">等待第一位用户说出唤醒词</div>
-          <article
-            v-for="member in participants"
-            :key="member.speaker_id"
-            class="member-card participant-card"
-            :style="{ '--speaker-color': speakerColor(member.speaker_id) }"
-          >
-            <div class="member-head">
-              <div>
-                <strong>参与人 {{ member.participant_number }} · {{ speakerName(member) }}</strong>
-                <small>{{ member.speaker_id.slice(0, 8) }} · {{ member.joined_by === 'manual' ? '手动加入' : '自动加入' }}</small>
-              </div>
-              <button
-                class="member-action danger"
-                :disabled="memberBusy === member.speaker_id"
-                @click="changeMembership(member.speaker_id, 'remove')"
-              >踢出</button>
-            </div>
-            <div class="voice-meta">
-              <span>发言 {{ member.turn_count }} 次</span>
-              <span>相似度 {{ formatScore(member.last_score) }}</span>
-            </div>
-          </article>
-        </section>
-
-        <section class="member-section observed-section">
-          <h3>侦听到的声音</h3>
-          <div v-if="!observedSpeakers.length" class="member-empty">激活期间听到的新声纹会出现在这里</div>
-          <article
-            v-for="speaker in observedSpeakers"
-            :key="speaker.speaker_id"
-            class="member-card observed-card"
-            :style="{ '--speaker-color': speakerColor(speaker.speaker_id) }"
-          >
-            <div class="member-head">
-              <div>
-                <strong>{{ speakerName(speaker) }}</strong>
-                <small>{{ speaker.speaker_id.slice(0, 8) }} · 侦听 {{ speaker.observation_count }} 次</small>
-              </div>
-              <button
-                class="member-action join"
-                :disabled="memberBusy === speaker.speaker_id"
-                @click="changeMembership(speaker.speaker_id, 'join')"
-              >加入</button>
-            </div>
-            <p class="voice-text">{{ speaker.last_text || '（无识别文本）' }}</p>
-            <div class="voice-meta">
-              <span>{{ speaker.created ? '新声纹' : '已有声纹' }}</span>
-              <span>相似度 {{ formatScore(speaker.last_score) }}</span>
-            </div>
-          </article>
-        </section>
-      </div>
 
       <details class="history-details">
         <summary>声纹识别记录（{{ voiceEvents.length }}）</summary>
@@ -648,6 +594,98 @@ onBeforeUnmount(() => {
         </div>
       </details>
     </aside>
+
+    <aside v-if="showDecisionPanel" class="card decision-panel">
+      <header class="sidebar-header">
+        <div>
+          <h2>决策模型调度</h2>
+          <p>输入 → 判断 → 结论（最近一轮）</p>
+        </div>
+        <span class="pill" :class="decisionDebug ? 'listening' : ''">
+          {{ decisionDebug ? decisionDebug.at : "等待语音" }}
+        </span>
+      </header>
+
+      <div v-if="!decisionDebug" class="dp-empty">
+        开启 VAD 说话后，这里会展示决策模型对这一轮的完整判断链路。
+      </div>
+
+      <div v-else class="dp-flow">
+        <!-- 输入 -->
+        <section class="dp-stage dp-input">
+          <div class="dp-stage-head"><span class="dp-badge">1</span><h3>输入</h3></div>
+          <div class="dp-quote">“{{ decisionDebug.text || "（无识别文本）" }}”</div>
+          <div class="dp-grid">
+            <span class="dp-k">说话人</span>
+            <span class="dp-v">
+              {{ decisionDebug.speaker_name || (decisionDebug.speaker_id ? `声纹 ${decisionDebug.speaker_id.slice(0, 8)}` : "—") }}
+            </span>
+            <span class="dp-k">唤醒事件</span>
+            <span :class="['dp-v', decisionDebug.wake ? 'dp-yes' : 'dp-no']">
+              {{ decisionDebug.wake ? "冷启动唤醒" : "无" }}
+            </span>
+            <span class="dp-k">会话状态</span>
+            <span :class="['dp-v', decisionDebug.session_active ? 'dp-yes' : 'dp-no']">
+              {{ decisionDebug.session_active ? "已激活" : "未激活" }}
+              <template v-if="decisionDebug.active_remaining != null">
+                · {{ decisionDebug.active_remaining }}s
+              </template>
+            </span>
+          </div>
+        </section>
+
+        <div class="dp-arrow">↓</div>
+
+        <!-- 判断 -->
+        <section class="dp-stage dp-judge">
+          <div class="dp-stage-head"><span class="dp-badge">2</span><h3>判断</h3></div>
+          <div class="dp-grid">
+            <span class="dp-k">面向 AI</span>
+            <span :class="['dp-v', decisionDebug.addressed ? 'dp-yes' : 'dp-no']">
+              {{ decisionDebug.addressed ? "是" : "否" }}
+            </span>
+            <span class="dp-k">回应类型</span>
+            <span class="dp-v">{{ decisionDebug.response_type }}</span>
+            <span class="dp-k">置信度</span>
+            <span class="dp-v">
+              <span class="dp-bar"><span class="dp-bar-fill" :style="{ width: `${Math.round((decisionDebug.confidence ?? 0) * 100)}%` }"></span></span>
+              {{ decisionDebug.confidence ?? "—" }}
+            </span>
+            <span class="dp-k">决策来源</span>
+            <span :class="['dp-v', decisionDebug.fallback ? 'dp-no' : 'dp-yes']">
+              {{ decisionDebug.fallback ? "回退门控（模型异常）" : "决策模型" }}
+            </span>
+          </div>
+          <div v-if="decisionDebug.decision_reason" class="dp-reason">
+            模型理由：{{ decisionDebug.decision_reason }}
+          </div>
+        </section>
+
+        <div class="dp-arrow">↓</div>
+
+        <!-- 结论 -->
+        <section class="dp-stage dp-result" :class="decisionDebug.should_reply ? 'is-reply' : 'is-silent'">
+          <div class="dp-stage-head"><span class="dp-badge">3</span><h3>结论</h3></div>
+          <div class="dp-verdict">
+            <span class="dp-verdict-tag">{{ decisionDebug.should_reply ? "回应" : "沉默" }}</span>
+            <span class="dp-verdict-desc">
+              {{
+                decisionDebug.interrupt
+                  ? "命中打断，停止播放"
+                  : decisionDebug.should_reply
+                    ? "送入 Hermes 生成回复"
+                    : decisionDebug.fallback
+                      ? "决策模型异常，已用传统门控"
+                      : "仅显示识别文本，不调用 Hermes"
+              }}
+            </span>
+          </div>
+          <div v-if="decisionDebug.gate_reason" class="dp-reason">
+            门控理由：{{ decisionDebug.gate_reason }}
+          </div>
+        </section>
+      </div>
+    </aside>
   </div>
 </template>
 
@@ -660,6 +698,9 @@ onBeforeUnmount(() => {
   grid-template-columns: minmax(0, 1fr) minmax(340px, 28vw);
   gap: 14px;
   overflow: hidden;
+}
+.app-shell.single-column {
+  grid-template-columns: minmax(0, 1fr);
 }
 .card {
   min-width: 0;
@@ -1150,6 +1191,155 @@ button:disabled {
   color: #64748b;
   font-size: 13px;
 }
+.decision-debug {
+  padding: 10px 12px;
+  font-size: 12px;
+}
+.decision-debug .panel-title {
+  margin-bottom: 6px;
+}
+.dd-text {
+  color: #334155;
+  margin-bottom: 6px;
+}
+.dd-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+}
+.dd-k {
+  color: #94a3b8;
+}
+.dd-v {
+  color: #334155;
+}
+.dd-yes {
+  color: #16a34a;
+}
+.dd-no {
+  color: #dc2626;
+}
+.dd-reason {
+  margin-top: 6px;
+  color: #64748b;
+}
+.decision-panel {
+  display: flex;
+  flex-direction: column;
+  background: #f8fafc;
+}
+.dp-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: #94a3b8;
+  font-size: 13px;
+  text-align: center;
+}
+.dp-flow {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.dp-stage {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #fff;
+  padding: 12px 14px;
+}
+.dp-stage-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.dp-stage-head h3 {
+  margin: 0;
+  font-size: 14px;
+  color: #0f172a;
+}
+.dp-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  background: #64748b;
+}
+.dp-input .dp-badge { background: #2563eb; }
+.dp-judge .dp-badge { background: #7c3aed; }
+.dp-result .dp-badge { background: #16a34a; }
+.dp-result.is-silent .dp-badge { background: #94a3b8; }
+.dp-quote {
+  color: #334155;
+  font-size: 14px;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  background: #f1f5f9;
+  border-radius: 8px;
+  border-left: 3px solid #2563eb;
+}
+.dp-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  font-size: 13px;
+}
+.dp-k { color: #94a3b8; }
+.dp-v { color: #334155; display: flex; align-items: center; gap: 8px; }
+.dp-yes { color: #16a34a; }
+.dp-no { color: #dc2626; }
+.dp-bar {
+  flex: 1;
+  max-width: 120px;
+  height: 6px;
+  border-radius: 3px;
+  background: #e2e8f0;
+  overflow: hidden;
+}
+.dp-bar-fill {
+  display: block;
+  height: 100%;
+  background: #7c3aed;
+}
+.dp-reason {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #64748b;
+}
+.dp-arrow {
+  text-align: center;
+  color: #cbd5e1;
+  font-size: 16px;
+  line-height: 1;
+}
+.dp-verdict {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.dp-verdict-tag {
+  font-size: 18px;
+  font-weight: 800;
+  color: #16a34a;
+}
+.dp-result.is-silent .dp-verdict-tag { color: #64748b; }
+.dp-verdict-desc {
+  font-size: 13px;
+  color: #475569;
+}
+.dp-result.is-reply { border-color: #bbf7d0; background: #f0fdf4; }
+.dp-result.is-silent { border-color: #e2e8f0; }
 @media (max-width: 980px) {
   .app-shell {
     height: auto;
@@ -1161,6 +1351,9 @@ button:disabled {
     min-height: calc(100vh - 28px);
   }
   .voice-sidebar {
+    min-height: 520px;
+  }
+  .decision-panel {
     min-height: 520px;
   }
   .app-header {

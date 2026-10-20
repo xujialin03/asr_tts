@@ -1,8 +1,49 @@
+name: zhiling
+
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: zhiling-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-qwen3_asr}
+      POSTGRES_USER: ${POSTGRES_USER:-qwen3_asr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - zhiling_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qwen3_asr} -d ${POSTGRES_DB:-qwen3_asr}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  voiceprint:
+    build:
+      context: ./voiceprint-service
+    container_name: zhiling-voiceprint
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8002:8001"
+    environment:
+      VOICEPRINT_DATABASE_URL: postgresql://${POSTGRES_USER:-qwen3_asr}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-qwen3_asr}
+      VOICEPRINT_MODEL_ID: iic/speech_campplus_sv_zh-cn_16k-common
+      VOICEPRINT_MODEL_REVISION: v1.0.0
+      VOICEPRINT_MODEL_DIR: /models
+      VOICEPRINT_DEVICE: cpu
+      VOICEPRINT_IDENTIFY_THRESHOLD: ${VOICEPRINT_IDENTIFY_THRESHOLD:-0.55}
+      VOICEPRINT_UNCERTAIN_THRESHOLD: ${VOICEPRINT_UNCERTAIN_THRESHOLD:-0.45}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - voiceprint_models:/models
+
   kws:
     build:
       context: ./kws-service
-    container_name: qwen3-kws
+    container_name: zhiling-kws
     restart: unless-stopped
     ports:
       - "127.0.0.1:8003:8003"
@@ -15,26 +56,7 @@ services:
     volumes:
       - kws_models:/models
 
-  voiceprint:
-    build:
-      context: ./voiceprint-service
-    container_name: qwen3-voiceprint
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8002:8001"
-    environment:
-      VOICEPRINT_DATABASE_URL: ${VOICEPRINT_DATABASE_URL:-postgresql://qwen3_asr:change-me@host.docker.internal:5432/qwen3_asr}
-      VOICEPRINT_MODEL_ID: iic/speech_campplus_sv_zh-cn_16k-common
-      VOICEPRINT_MODEL_REVISION: v1.0.0
-      VOICEPRINT_MODEL_DIR: /models
-      VOICEPRINT_DEVICE: cpu
-      VOICEPRINT_IDENTIFY_THRESHOLD: ${VOICEPRINT_IDENTIFY_THRESHOLD:-0.55}
-      VOICEPRINT_UNCERTAIN_THRESHOLD: ${VOICEPRINT_UNCERTAIN_THRESHOLD:-0.45}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - voiceprint_models:/models
-
 volumes:
-  kws_models:
+  zhiling_pgdata:
   voiceprint_models:
+  kws_models:

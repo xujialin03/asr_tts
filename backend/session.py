@@ -13,14 +13,19 @@ from dataclasses import dataclass, field
 import httpx
 
 import config
+from decision import DecisionClient, InteractionDecision, build_decision_client
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 ASR_CHUNK_BYTES = 8000 * 4  # 500ms @ 16kHz float32 mono
 MAX_TTS_INSTRUCTION_CHARS = 500
 TURN_TTL_SECONDS = 300.0
 AUDIO_REF_TTL_SECONDS = 300.0
 MAX_OBSERVED_SPEAKERS = 32
+CONTEXT_WINDOW_SIZE = 5
+MAX_PERFORMANCE_EVENTS = 200
+MAX_TOPICS = 8
+MAX_TOPIC_CHARS = 80
 
 VOICE_RESPONSE_CONTRACT = """[VOICE_RESPONSE_CONTRACT]
 Your final answer will be displayed to the user and synthesized by Breeze-TTS-2.
@@ -125,28 +130,6 @@ class SpeakerIdentity:
 
 
 @dataclass
-class Participant:
-    identity: SpeakerIdentity
-    number: int
-    joined_at: float
-    joined_by: str
-    last_seen_at: float
-    last_score: float | None = None
-    turn_count: int = 0
-
-    def public(self) -> dict:
-        return {
-            **self.identity.public(),
-            "participant_number": self.number,
-            "joined_at": self.joined_at,
-            "joined_by": self.joined_by,
-            "last_seen_at": self.last_seen_at,
-            "last_score": self.last_score,
-            "turn_count": self.turn_count,
-        }
-
-
-@dataclass
 class ObservedSpeaker:
     identity: SpeakerIdentity
     first_seen_at: float
@@ -178,12 +161,12 @@ class VoiceTurn:
     text: str = ""
     language: str = ""
     speaker: SpeakerIdentity | None = None
-    participant_number: int | None = None
     wake_event: bool = False
-    auto_joined: bool = False
+    wake_detected: bool = False
     should_reply: bool = False
     interrupt: bool = False
     reply_text: str = ""
+    decision: InteractionDecision | None = None
     reason: str = ""
     audio_ref: str | None = None
     evaluated: bool = False
@@ -196,15 +179,15 @@ class VoiceTurn:
             "source": self.source,
             "started_while_active": self.started_while_active,
             "speaker": self.speaker.public() if self.speaker else None,
-            "membership": {
-                "is_participant": self.participant_number is not None,
-                "participant_number": self.participant_number,
-            },
             "wake_event": self.wake_event,
-            "auto_joined": self.auto_joined,
             "should_reply": self.should_reply,
             "interrupt": self.interrupt,
             "reply_text": self.reply_text,
+            "is_addressed_to_ai": self.decision.is_addressed_to_ai if self.decision else None,
+            "response_type": self.decision.response_type if self.decision else "silent",
+            "confidence": self.decision.confidence if self.decision else None,
+            "decision_reason": self.decision.reason if self.decision else "",
+            "decision_fallback": self.decision.fallback if self.decision else False,
             "reason": self.reason,
         }
 
@@ -224,11 +207,13 @@ class Session:
     asr_session_id: str | None = None
     last_asr: dict = field(default_factory=lambda: {"language": "", "text": ""})
     active_until: float = 0.0
-    participants: dict[str, Participant] = field(default_factory=dict)
     observed_speakers: dict[str, ObservedSpeaker] = field(default_factory=dict)
     turns: dict[str, VoiceTurn] = field(default_factory=dict)
     voice_audio_refs: dict[str, VoiceAudioRef] = field(default_factory=dict)
-    next_participant_number: int = 1
+    conversation_context: list[dict] = field(default_factory=list)
+    topics: list[str] = field(default_factory=list)
+    performance_events: list[dict] = field(default_factory=list)
+    decision_client: DecisionClient | None = field(default=None, repr=False)
     next_turn_sequence: int = 1
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -324,24 +309,6 @@ class Session:
         self.cleanup_expired()
         return self.turns.get(turn_id)
 
-    def _add_participant(self, identity: SpeakerIdentity, joined_by: str) -> Participant:
-        existing = self.participants.get(identity.speaker_id)
-        if existing:
-            return existing
-        now = time.time()
-        participant = Participant(
-            identity=identity,
-            number=self.next_participant_number,
-            joined_at=now,
-            joined_by=joined_by,
-            last_seen_at=now,
-            last_score=identity.score,
-        )
-        self.next_participant_number += 1
-        self.participants[identity.speaker_id] = participant
-        self.observed_speakers.pop(identity.speaker_id, None)
-        return participant
-
     def _observe(self, identity: SpeakerIdentity, text: str) -> ObservedSpeaker:
         now = time.time()
         observed = self.observed_speakers.get(identity.speaker_id)
@@ -364,24 +331,6 @@ class Session:
             oldest = min(self.observed_speakers.values(), key=lambda item: item.last_seen_at)
             self.observed_speakers.pop(oldest.identity.speaker_id, None)
         return observed
-
-    def add_participant(self, speaker_id: str) -> Participant | None:
-        observed = self.observed_speakers.get(speaker_id)
-        if not observed:
-            return self.participants.get(speaker_id)
-        participant = self._add_participant(observed.identity, "manual")
-        # A manually added participant should be able to speak on the next turn
-        # without repeating the wake word. Their earlier wake was treated as a
-        # stranger's (no window extension), so open a fresh window now; otherwise
-        # the activation from the first participant may already have expired.
-        self.activate()
-        return participant
-
-    def remove_participant(self, speaker_id: str) -> Participant | None:
-        participant = self.participants.pop(speaker_id, None)
-        if participant:
-            self._observe(participant.identity, "")
-        return participant
 
     def store_voice_audio(
         self,
@@ -411,6 +360,196 @@ class Session:
     def _wake_detected(self, text: str, kws_detected: bool) -> bool:
         return kws_detected or any(word and word in text for word in config.WAKE_WORDS)
 
+    def record_performance(
+        self,
+        stage: str,
+        elapsed_ms: float,
+        *,
+        source: str,
+        turn_id: str | None = None,
+        detail: dict | None = None,
+    ) -> None:
+        event = {
+            "timestamp": time.time(),
+            "stage": stage,
+            "elapsed_ms": round(max(0.0, float(elapsed_ms)), 1),
+            "source": source,
+            "turn_id": turn_id,
+            "detail": detail or {},
+        }
+        self.performance_events.append(event)
+        del self.performance_events[:-MAX_PERFORMANCE_EVENTS]
+        logger.info(
+            "performance session=%s source=%s stage=%s elapsed_ms=%.1f turn=%s detail=%s",
+            self.id,
+            source,
+            stage,
+            event["elapsed_ms"],
+            turn_id,
+            event["detail"],
+        )
+
+    def performance_snapshot(self) -> list[dict]:
+        return list(self.performance_events)
+
+    def _append_context(self, role: str, text: str, speaker_id: str | None = None) -> None:
+        self.conversation_context.append(
+            {"role": role, "text": text, "speaker_id": speaker_id, "timestamp": time.time()}
+        )
+        del self.conversation_context[:-CONTEXT_WINDOW_SIZE]
+
+    def _track_topic(self, text: str) -> None:
+        """Record the current user utterance as the active topic.
+
+        A lightweight heuristic for the Topic model in the architecture: the most
+        recent admitted user turn is treated as the current topic, with earlier
+        topics kept as history. A real topic model would summarize/merge; this
+        keeps a bounded, de-duplicated list so the decision model sees what the
+        room is on.
+        """
+        topic = " ".join((text or "").split())[:MAX_TOPIC_CHARS]
+        if not topic:
+            return
+        if self.topics and self.topics[-1] == topic:
+            return
+        self.topics.append(topic)
+        del self.topics[:-MAX_TOPICS]
+
+    def _has_assistant_reply(self) -> bool:
+        return any(entry["role"] == "assistant" for entry in self.conversation_context)
+
+    def _looks_like_followup(self, text: str) -> bool:
+        """Whether an utterance reads as a question / continuation follow-up.
+
+        Guards the continuation fallback so it fires on real follow-ups
+        ("最近是不是有个台风啊") but not on bare acknowledgments ("嗯", "好的",
+        "谢谢") that the decision model correctly leaves silent.
+        """
+        text = (text or "").strip()
+        if not text:
+            return False
+        if any(mark in text for mark in ("?", "？")):
+            return True
+        if any(word in text for word in config.FOLLOWUP_MARKERS):
+            return True
+        return text[-1] in config.FOLLOWUP_SENTENCE_FINALS
+
+    def _fallback_decision(self, turn: VoiceTurn) -> InteractionDecision:
+        should_respond = turn.should_reply
+        return InteractionDecision(
+            is_addressed_to_ai=should_respond,
+            should_respond=should_respond,
+            response_type="normal" if should_respond else "silent",
+            confidence=0.0,
+            reason="决策模型不可用，使用唤醒词与会话窗口回退",
+            fallback=True,
+        )
+
+    def _decision_state(self, turn: VoiceTurn) -> dict:
+        speaker = turn.speaker
+        return {
+            "agent": {
+                "name": config.AGENT_NAME,
+                "role": config.AGENT_ROLE,
+                "persona": config.AGENT_PERSONA,
+            },
+            "current_message": turn.text,
+            "speaker": {
+                "speaker_id": speaker.speaker_id if speaker else None,
+                "display_name": speaker.display_name if speaker else None,
+                "preferred_name": speaker.preferred_name if speaker else None,
+            },
+            "session": {
+                "active": self.is_active(),
+                "topics": list(self.topics),
+                "recent_messages": list(self.conversation_context),
+            },
+            "wake_word_detected": turn.wake_detected,
+            "assistant_speaking": turn.assistant_speaking,
+            "has_pending_task": False,
+        }
+
+    async def decide_turn(self, turn: VoiceTurn) -> VoiceTurn:
+        if not turn.text or turn.interrupt or not turn.speaker:
+            return turn
+        started = time.monotonic()
+        fallback = self._fallback_decision(turn)
+        if self.decision_client is None:
+            turn.decision = fallback
+            return turn
+        try:
+            decision = await self.decision_client.decide(self._decision_state(turn))
+        except Exception as exc:
+            logger.warning(
+                "decision failed session=%s turn=%s error=%s: %s",
+                self.id,
+                turn.id,
+                type(exc).__name__,
+                exc,
+            )
+            decision = fallback
+        turn.decision = decision
+        if turn.wake_detected and not decision.should_respond:
+            decision = InteractionDecision(
+                is_addressed_to_ai=True,
+                should_respond=True,
+                response_type="normal",
+                confidence=decision.confidence,
+                reason="命中唤醒词，强制进入回复流程",
+                fallback=decision.fallback,
+            )
+            turn.decision = decision
+        elif (
+            not decision.should_respond
+            and decision.is_addressed_to_ai
+            and self.is_active()
+            and self._has_assistant_reply()
+            and self._looks_like_followup(turn.text)
+        ):
+            # The decision model marked the turn as addressed to the assistant
+            # but chose not to respond. Inside the active window, right after the
+            # assistant spoke, that is the classic continuation follow-up (e.g.
+            # "最近是不是有个台风啊" after a weather answer). The model's
+            # respond/confidence on such follow-ups sits on the decision boundary
+            # and flips, so keep the conversation going.
+            decision = InteractionDecision(
+                is_addressed_to_ai=True,
+                should_respond=True,
+                response_type="normal",
+                confidence=decision.confidence,
+                reason="活跃窗口内延续助理话题，兜底进入回复流程",
+                fallback=decision.fallback,
+            )
+            turn.decision = decision
+        turn.should_reply = decision.should_respond
+        if decision.should_respond:
+            turn.reply_text = turn.text
+            self.activate()
+            self._append_context("user", turn.reply_text, turn.speaker.speaker_id)
+            self._track_topic(turn.reply_text)
+            turn.reason = decision.reason or turn.reason
+        else:
+            turn.reply_text = ""
+            turn.reason = decision.reason or "决策模型判定无需回应"
+        self.record_performance(
+            "decision_model",
+            (time.monotonic() - started) * 1000,
+            source="backend",
+            turn_id=turn.id,
+            detail={
+                "addressed": decision.is_addressed_to_ai,
+                "respond": decision.should_respond,
+                "response_type": decision.response_type,
+                "fallback": decision.fallback,
+            },
+        )
+        logger.info(
+            "decision session=%s turn=%s speaker=%s wake=%s context=%s addressed=%s respond=%s type=%s fallback=%s",
+            self.id, turn.id, turn.speaker.speaker_id, turn.wake_detected, len(self.conversation_context),
+            decision.is_addressed_to_ai, decision.should_respond, decision.response_type, decision.fallback,
+        )
+        return turn
+
     def evaluate_turn(
         self,
         turn_id: str,
@@ -432,32 +571,19 @@ class Session:
         wake_detected = self._wake_detected(text, kws_detected)
         # A turn normally snapshots activation at speech-start. Also honor the
         # current server-side window at evaluation time: queued VAD turns can be
-        # created just before an earlier turn activates the session, and should
-        # not require the same participant to repeat the wake word.
+        # created just before an earlier turn activates the session.
         active_for_turn = turn.started_while_active or self.is_active()
         turn.text = text
         turn.language = language
         turn.speaker = identity
+        turn.wake_detected = wake_detected
         turn.wake_event = wake_detected and not active_for_turn
         turn.audio_ref = self.store_voice_audio(audio, identity.speaker_id, turn.id)
 
-        participant = self.participants.get(identity.speaker_id)
-        if participant is None and not self.participants and wake_detected:
-            participant = self._add_participant(identity, "wake")
-            turn.auto_joined = True
-        elif participant is None:
-            self._observe(identity, text)
-
-        if participant is None:
-            turn.reason = "侦听到未加入会话的声纹"
-            turn.evaluated = True
-            return turn
-
-        participant.identity = identity
-        participant.last_seen_at = time.time()
-        participant.last_score = identity.score
-        participant.turn_count += 1
-        turn.participant_number = participant.number
+        # No participant gating: every resolved speaker is observed for
+        # diagnostics, and every turn flows to the decision model, which decides
+        # whether to reply.
+        self._observe(identity, text)
 
         if turn.assistant_speaking:
             matched, remainder = self.match_interrupt(text)
@@ -467,31 +593,31 @@ class Session:
             elif remainder:
                 turn.should_reply = True
                 turn.reply_text = remainder
-                turn.reason = "参与人命中打断词并包含后续问题"
+                turn.reason = "命中打断词并包含后续问题"
                 self.activate()
             else:
-                turn.reason = "参与人命中纯打断指令"
+                turn.reason = "命中纯打断指令"
                 self.activate()
             turn.evaluated = True
             return turn
 
-        allowed = wake_detected or active_for_turn
-        if not allowed:
-            turn.reason = "会话未激活，请先说唤醒词"
-        elif not text:
+        # Provisional reply flag: used only as the fallback when the decision
+        # model is unavailable. When the model responds it is the authority.
+        if not text:
             turn.reason = "空识别结果"
-        else:
+        elif wake_detected or active_for_turn:
             turn.should_reply = True
             turn.reply_text = text
             if wake_detected:
                 turn.reason = (
-                    f"参与人命中声学唤醒词：{kws_keyword or '已配置关键词'}"
+                    f"命中声学唤醒词：{kws_keyword or '已配置关键词'}"
                     if kws_detected
-                    else "参与人命中精确文本唤醒词"
+                    else "命中精确文本唤醒词"
                 )
             else:
-                turn.reason = "参与人在连续对话窗口内"
-            self.activate()
+                turn.reason = "在连续对话窗口内"
+        else:
+            turn.reason = "会话未激活"
 
         turn.evaluated = True
         return turn
@@ -516,7 +642,6 @@ class Session:
         return False, normalized
 
     def snapshot(self) -> dict:
-        participants = sorted(self.participants.values(), key=lambda item: item.number)
         observed = sorted(
             self.observed_speakers.values(), key=lambda item: item.last_seen_at, reverse=True
         )
@@ -524,38 +649,27 @@ class Session:
             "session_id": self.id,
             "active": self.is_active(),
             "active_remaining": round(self.active_remaining(), 1),
-            "participants": [participant.public() for participant in participants],
             "observed_speakers": [speaker.public() for speaker in observed],
         }
 
     # ---- Hermes turn ----
     async def _chat_hermes(self, turn: VoiceTurn) -> str:
-        participant = self.participants[turn.speaker.speaker_id]
         context = {
             "session_id": self.id,
             "turn_id": turn.id,
             "turn_sequence": turn.sequence,
             "source": turn.source,
             "wake_event": turn.wake_event,
-            "speaker": {
-                **turn.speaker.public(),
-                "participant_number": participant.number,
-            },
-            "participants": [
-                {
-                    **item.identity.public(),
-                    "participant_number": item.number,
-                }
-                for item in sorted(self.participants.values(), key=lambda value: value.number)
-            ],
-            "participant_count": len(self.participants),
+            "speaker": turn.speaker.public(),
             "audio_ref": turn.audio_ref,
+            "response_type": turn.decision.response_type if turn.decision else "normal",
         }
         hermes_message = (
             VOICE_RESPONSE_CONTRACT
             + "[VOICE_CONTEXT]"
             + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
             + "[/VOICE_CONTEXT]\n"
+            + ("请仅作一句简短确认或追问。\n" if context["response_type"] == "brief" else "")
             + turn.reply_text
         )
         process = await asyncio.create_subprocess_exec(
@@ -604,11 +718,11 @@ class Session:
                 raise PermissionError("turn was not admitted to the conversation")
             if turn.consumed:
                 raise ValueError("turn already consumed")
-            if not turn.speaker or turn.speaker.speaker_id not in self.participants:
-                raise PermissionError("speaker is no longer a conversation participant")
             raw_reply = await self._chat_hermes(turn)
             turn.consumed = True
-            return parse_hermes_reply(raw_reply)
+            reply = parse_hermes_reply(raw_reply)
+            self._append_context("assistant", reply.text)
+            return reply
 
     def update_speaker_profile(
         self,
@@ -617,9 +731,7 @@ class Session:
         preferred_name: str | None,
     ) -> None:
         identity = None
-        if speaker_id in self.participants:
-            identity = self.participants[speaker_id].identity
-        elif speaker_id in self.observed_speakers:
+        if speaker_id in self.observed_speakers:
             identity = self.observed_speakers[speaker_id].identity
         if identity:
             identity.display_name = display_name
@@ -633,12 +745,18 @@ class Session:
 
 
 class SessionManager:
-    def __init__(self) -> None:
+    def __init__(self, decision_client: DecisionClient | None = None) -> None:
         self._store: dict[str, Session] = {}
+        self._decision_client = decision_client
+
+    async def warmup_decisions(self) -> None:
+        warmup = getattr(self._decision_client, "warmup", None)
+        if warmup:
+            await warmup()
 
     def create(self) -> Session:
         sid = secrets.token_hex(16)
-        session = Session(id=sid)
+        session = Session(id=sid, decision_client=self._decision_client)
         self._store[sid] = session
         return session
 
@@ -663,8 +781,12 @@ class SessionManager:
 
     def remove_speaker(self, speaker_id: str) -> None:
         for session in self._store.values():
-            session.participants.pop(speaker_id, None)
             session.observed_speakers.pop(speaker_id, None)
+            session.voice_audio_refs = {
+                token: ref
+                for token, ref in session.voice_audio_refs.items()
+                if ref.speaker_id != speaker_id
+            }
             session.voice_audio_refs = {
                 token: ref
                 for token, ref in session.voice_audio_refs.items()
@@ -675,4 +797,4 @@ class SessionManager:
         return self._store.pop(sid, None) is not None
 
 
-sessions = SessionManager()
+sessions = SessionManager(decision_client=build_decision_client())

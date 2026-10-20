@@ -20,13 +20,22 @@ services:
     fail_open: true
 
 # PostgreSQL used by project-owned agent modules (for example, voice profiles).
+# The compose stack runs a dedicated postgres on host port 5433 (5432 is left
+# free for other projects). Keep these in sync with POSTGRES_* in .env.
 database:
   postgresql:
     host: 127.0.0.1
-    port: 5432
+    port: 5433
     database: qwen3_asr
     user: qwen3_asr
     password: change-me
+
+# 角色模型（AgentProfile）：注入决策模型交互判断，让模型知道“助手是谁”。
+# Hermes 在自己的 profile 里另有一份人设；这里只用于“是否面向 AI / 是否回应”的判断。
+agent:
+  name: 志玲
+  role: 语音助理
+  persona: "你叫志玲，是一名语音助理，正在多人语音房间里通过麦克风听取用户发言，判断用户是否在对你说话。"
 
 assistant:
   wake_words:
@@ -45,6 +54,36 @@ assistant:
     - "先别说(?:了)?"
     - "别说(?:了)?"
     - "打住"
+  # 延续性兜底：决策模型判“面向AI但不回应”时，若文本命中这些疑问/延续线索，
+  # 且参与人在活跃窗口内、窗口里有助理上一轮回复，则兜底进入回复流程。
+  followup_markers:
+    - "是不是"
+    - "有没有"
+    - "能不能"
+    - "要不要"
+    - "怎么"
+    - "为什么"
+    - "什么"
+    - "多少"
+    - "几点"
+    - "哪里"
+    - "哪个"
+    - "哪些"
+    - "吗"
+    - "呢"
+    - "吧"
+  followup_sentence_finals: ["?", "？", "吗", "呢", "吧", "啊", "呀"]
+
+# 交互决策模型：OpenAI 兼容生成式模型，判断“是否面向 AI / 是否回应”。
+decision_model:
+  base_url: http://mo.sy.cn:8000/v1
+  model: qwen3.6-35b-awq
+  # api_key: ""
+  timeout_seconds: 8.0
+  max_tokens: 512
+  # 关闭思考：思考模式会把输出预算烧光导致 JSON 截断，且延迟 ~3s；关思考 ~1s。
+  enable_thinking: false
+  max_retries: 3
 
 hermes:
   # Client for the dedicated Hermes agent. Hermes owns conversation history

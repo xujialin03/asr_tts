@@ -11,16 +11,16 @@ Silero VAD（唯一语音输入模式，可通过界面开关启停）
   ↓
 Qwen3-ASR
   ↓
-唤醒词 / 连续对话门控
-  ├─ 未触发：只显示识别文本，不调用 Hermes
-  └─ 已触发：项目专用 Hermes agent
-                ↓
-             Breeze-TTS-2
-                ↓
-             Web Audio 流式播放
+决策模型（上下文 / 说话人 / 唤醒信号）
+  ├─ silent：仅显示识别文本，不调用 Hermes
+  └─ normal / brief：项目专用 Hermes agent
+                         ↓
+                      Breeze-TTS-2
+                         ↓
+                      Web Audio 流式播放
 ```
 
-前端负责麦克风、VAD、播放和用户交互；FastAPI 后端负责本地 Session、门控状态和远程服务代理。项目专用 Hermes agent 独占管理助理人设、对话上下文和历史，backend 不保存或同步对话历史。Hermes 的最终响应使用 `{"text":"...","instruction":"..."}`：`text` 用于页面展示和朗读，`instruction` 作为本轮动态 Voice Direction 传给 TTS；解析失败时兼容旧的纯文本回复。
+前端负责麦克风、VAD、播放和用户交互；FastAPI 后端负责本地 Session、决策状态和远程服务代理。每个 Session 独立维护最近五条真实用户/助理消息，决策模型仅读取该上下文并输出结构化交互决策；Hermes 仍独占管理助理人设、长对话历史与任务执行。Hermes 的最终响应使用 `{"text":"...","instruction":"..."}`：`text` 用于页面展示和朗读，`instruction` 作为本轮动态 Voice Direction 传给 TTS；解析失败时兼容旧的纯文本回复。
 
 ## 2. Silero VAD 输入模式
 
@@ -69,17 +69,19 @@ VAD 在 `onSpeechEnd(audio)` 产生完整 16kHz float32 PCM 片段，前端将�
 - `backend/main.py`：turn begin/evaluate、参与人加入/踢出、按 turn 调用 chat
 - `frontend/src/App.vue`：VAD 轮次队列、参与人和侦听列表
 
-免手持模式识别到环境人声后，不应直接调用 Hermes。文本先经过门控；冷启动时必须明确命中唤醒词，普通问句和指令不会自行激活：
+免手持模式识别到环境人声后，文本先完成声纹与参与资格校验，再由决策模型结合完整交互上下文决定是否面向 AI 及是否回应。VAD→ASR 后送入决策模型的决策状态按架构图的数据模型组装：
 
-```text
-ASR 文本
-  ↓
-是否命中唤醒词？ ──是→ 激活并回复
-  ↓ 否
-是否在活跃窗口内？ ──是→ 续期并回复
-  ↓ 否
-静默丢弃，只显示识别文本
-```
+- `agent`：角色模型（AgentProfile），来自 `config.yaml` 的 `agent` 段（`name` / `role` / `persona`），让决策模型知道“助手是谁”。Hermes 在自己的 profile 里另有一份人设，这里只用于交互判断。
+- `current_message`：本轮 ASR 文本。
+- `speaker`：声纹身份（`speaker_id`、显示名、参与人编号、是否参与人）。
+- `session`：会话模型，含 `active`、`participant_count`、`topics`（当前话题列表）与 `recent_messages`（最近五条真实用户/助理消息）。
+- `wake_word_detected`、`assistant_speaking`、`has_pending_task`：信号位。
+
+`recent_messages` 是判断延续性追问的关键上下文。`topics` 目前是启发式：把最近被放行的用户发言按序去重保留，作为“房间在聊什么”的粗略信号。决策模型当前只做交互判断（是否面向 AI / 是否回应），暂不做话题归纳抽取；需要真正的 Topic 归纳时再接生成式后端（如 Hermes）。
+
+延续性兜底：决策模型对“参与人在活跃窗口内、紧接助理回复之后的延续追问”（如天气回答后问“最近是不是有个台风啊”）处在判断边界，`should_respond` 会抖动甚至误判 silent。当决策模型判 `is_addressed_to_ai=True` 但 `should_respond=False`，且满足“参与人 + 会话活跃 + 窗口内有助理回复 + 文本像追问（命中 `assistant.followup_markers` 或以 `assistant.followup_sentence_finals` 结尾）”时，兜底强制进入回复流程。纯确认词（“嗯”“好的”）不命中追问特征，仍保持 silent；`is_addressed_to_ai=False`（人类互聊）不触发兜底。
+
+唤醒词和激活窗口是决策信号及模型异常时的保守回退，不再是连续对话的唯一入口；未加入的声纹仍不能被决策模型放行到 Hermes。
 
 默认唤醒词：
 
@@ -92,8 +94,9 @@ ASR 文本
 
 门控实现：
 
-- `backend/session.py`：`should_reply`、`activate`、`is_active`
-- `backend/main.py`：`POST /api/decide`
+- `backend/session.py`：`decide_turn`、`should_reply`、`activate`、`is_active`
+- `backend/decision.py`：决策模型 Schema、超时和回退
+- `backend/main.py`：`POST /api/session/{session_id}/turns/{turn_id}/evaluate`
 - `frontend/src/App.vue`：`handleVadAudio`
 
 ## 4. AI 激活窗口

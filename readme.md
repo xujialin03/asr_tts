@@ -1,19 +1,21 @@
-# Qwen3-ASR 语音助手
+# 知玲 Zhiling
 
-一个浏览器端语音助手原型，串联 Qwen3-ASR、Silero VAD、sherpa-onnx KWS、CAM++ 声纹识别、Hermes agent 与 Breeze-TTS-2。
+一个浏览器端多人语音助手原型，串联 Qwen3-ASR、Silero VAD、CAM++ 声纹识别、决策模型（远程生成式）、Hermes agent 与 Breeze-TTS-2。
 
-前端负责麦克风采集、免手持语音检测和流式音频播放；FastAPI 后端负责会话状态、唤醒/打断门控、声纹解析以及远程服务代理。对话人设和历史由项目专用 Hermes agent 独占管理。
+名字取自助手人设“志玲”，也涵盖 ASR 的同音误识别（诗林/志宁/志凌）——叫得准不准，它都认得你是在叫它。
+
+前端负责麦克风采集、免手持语音检测和流式音频播放；FastAPI 后端负责会话状态、决策模型调度、唤醒/打断门控、声纹解析以及远程服务代理。对话人设和历史由项目专用 Hermes agent 独占管理。
 
 ## 功能
 
 - 👂 **纯 VAD 语音**：Silero VAD 是唯一语音输入模式；通过界面开关持续监听麦克风，自动检测说话起止并切分完整语音片段。
+- 🧠 **决策模型调度**：每段语音经声纹解析后交给远程生成式决策模型，结合上下文与说话人判断“是否面向 AI / 是否回应”，输出 normal / brief / silent；页面右侧面板可视化「输入 → 判断 → 结论」全链路。
 - 🔔 **关键词唤醒**：冷启动时由 sherpa-onnx 声学 KWS 或 ASR 文本唤醒词激活助手；KWS 不可用时可降级为文本唤醒。
 - 💬 **连续对话**：激活后在配置的时间窗口内无需重复唤醒，TTS 播放期间会自动延长窗口。
 - ✋ **语音打断**：AI 播放期间先完成 ASR，再根据打断词确认是否停止播放，减少环境声音造成的误打断。
-- 🧠 **Hermes 对话**：项目专用 Hermes agent 管理助理人设、上下文和对话历史，并为每条回复输出适配内容的 TTS 语气指令。
+- 🗣️ **Hermes 对话**：项目专用 Hermes agent 管理助理人设、上下文和对话历史，并为每条回复输出适配内容的 TTS 语气指令。
 - 🔊 **流式语音回复**：Breeze-TTS-2 返回裸 PCM，浏览器边接收边播放；支持自动朗读、单条重播和停止播放。
-- 🗣️ **多人声纹会话**：首位唤醒者自动成为参与人 1；激活期间听到的新声纹只进入侦听列表，手动加入后才可参与对话。
-- 👥 **参与人管理**：页面侧栏分别展示已加入参与人和侦听到的声音，支持加入和踢出；被踢出者后续不会触发 Hermes。
+- 👥 **多人声纹侦听**：开启 VAD 后持续侦听，每段语音都会解析声纹身份；当前多人支持多人轮流发言，不含重叠讲话的说话人分离。
 
 > 交互状态机和设计约束见 [语音交互详细设计](docs/voice-interaction-design.md)。
 
@@ -25,6 +27,7 @@
 - 语音识别：远程 Qwen3-ASR 流式识别服务
 - 关键词唤醒：独立可选的 sherpa-onnx 中文 KWS 服务
 - 声纹识别：CAM++ 服务 + PostgreSQL
+- 交互决策：远程 OpenAI 兼容生成式决策模型（默认 `qwen3.6-35b-awq`，可换端点）
 - 对话 Agent：项目专用 Hermes agent
 - 语音合成：远程 Breeze-TTS-2 流式合成服务
 - 本地服务编排：Docker Compose
@@ -40,13 +43,12 @@
 FastAPI backend
   ├─ /api/transcribe ──────────────────▶ 远程 Qwen3-ASR（VAD 整段转写）
   ├─ /api/kws/detect ──────────────────▶ 本地 sherpa-onnx KWS
-  ├─ /api/session/.../turns/evaluate ──▶ 声纹解析 + 参与资格 + 唤醒/打断门控
-  ├─ /api/session/.../participants ────▶ 加入 / 踢出会话参与人
+  ├─ /api/session/.../turns/evaluate ──▶ 声纹解析 + 决策模型判断 + 唤醒/打断门控
   ├─ /api/chat ────────────────────────▶ 项目专用 Hermes agent
   └─ /api/tts ─────────────────────────▶ 远程 Breeze-TTS-2
 ```
 
-免手持模式下，ASR 与 KWS 会并行处理完整语音片段。首位说出唤醒词的人经声纹识别后自动加入会话；会话激活期间每段语音都会先确认声纹和参与资格，未加入者只出现在侦听列表，不会进入聊天或 Hermes 上下文。当前“多人会话”支持多人轮流发言，不包含重叠讲话的说话人分离。
+免手持模式下，ASR 与 KWS 会并行处理完整语音片段。每段语音都会先解析声纹身份，再交给决策模型结合上下文与说话人判断是否回应；决策模型异常时回退到唤醒词与连续对话窗口门控。当前“多人会话”支持多人轮流发言，不包含重叠讲话的说话人分离——重叠讲话会被 VAD、ASR 和 CAM++ 当作一个混合片段。
 
 远程 ASR/TTS 不需要向浏览器开放 CORS，浏览器只访问 FastAPI；开发环境下 Vite 再将 `/api/*` 代理到 FastAPI。
 
@@ -67,12 +69,11 @@ config.yaml.example   应用配置模板
 
 - Python 3.10+ 与 [uv](https://docs.astral.sh/uv/)
 - Node.js 与 npm
-- Docker 与 Docker Compose
-- 一个可用的 PostgreSQL 实例（当前 `compose.yaml` 不启动 PostgreSQL）
+- Docker 与 Docker Compose（`compose.yaml` 自带 PostgreSQL、声纹与 KWS 服务）
 - 可访问的 Qwen3-ASR 与 Breeze-TTS-2 服务
 - 可调用的项目专用 Hermes agent client
 
-如果只调试部分链路，KWS 可关闭。参与资格依赖声纹确认；声纹服务不可用、音频过短或识别失败时，本段会 fail closed，不会发送给 Hermes。
+如果只调试部分链路，KWS 可关闭。每段语音都会解析声纹身份；声纹服务不可用、音频过短或识别失败时，本段会 fail closed，不会发送给 Hermes。
 
 ## 配置
 
@@ -92,7 +93,9 @@ cp .env.example .env
 - `services.voiceprint`：本地声纹服务地址
 - `services.kws`：KWS 地址、启用状态与失败降级策略
 - `database.postgresql`：项目使用的 PostgreSQL 连接信息
+- `agent`：角色模型（AgentProfile），注入决策模型交互判断，让模型知道"助手是谁"
 - `assistant`：唤醒词、连续对话窗口和打断正则
+- `decision_model`：交互决策模型地址、模型名、超时、思考开关和重试次数
 - `hermes`：Hermes client 路径和超时时间
 - `tts`：Hermes 未返回动态语气时的兜底提示词、`cfg_scale`、参考音频及其文本
 
@@ -100,9 +103,9 @@ cp .env.example .env
 
 ### `.env`
 
-根目录 `.env` 供 Docker Compose 注入声纹/KWS 服务配置，主要包括：
+根目录 `.env` 供 Docker Compose 注入服务配置，主要包括：
 
-- `VOICEPRINT_DATABASE_URL`
+- `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD`：compose 内置 PostgreSQL 的库与账号（声纹服务自动复用，需与 `config.yaml` 的 `database.postgresql` 保持一致）
 - `VOICEPRINT_IDENTIFY_THRESHOLD`
 - `VOICEPRINT_UNCERTAIN_THRESHOLD`
 - `KWS_KEYWORDS_SCORE`
@@ -113,25 +116,15 @@ cp .env.example .env
 
 ## 运行
 
-### 1. 准备 PostgreSQL
+### 1. 启动 PostgreSQL、声纹与 KWS 服务
 
-声纹服务复用已有 PostgreSQL。首次使用时，用管理员账号创建项目数据库和独立账号：
-
-```bash
-docker exec -i postgres psql -U root -d postgres \
-  -v app_user=qwen3_asr \
-  -v app_password='替换为随机强密码' \
-  -v app_database=qwen3_asr \
-  < voiceprint-service/migrations/000_create_database.psql
-```
-
-按实际环境替换容器名、管理员账号和密码，并确保 `.env` 中的 `VOICEPRINT_DATABASE_URL` 使用相同凭据。声纹服务启动时会自动执行表结构迁移。
-
-### 2. 启动 KWS 与声纹服务
+`compose.yaml` 自带专属 PostgreSQL（宿主机端口 5433，避开其他项目的 5432）、声纹与 KWS 服务。先在 `.env` 里设置 `POSTGRES_PASSWORD`（需与 `config.yaml` 的 `database.postgresql.password` 一致），然后：
 
 ```bash
-docker compose up -d --build kws voiceprint
+docker compose up -d --build
 ```
+
+声纹服务启动时会自动执行表结构迁移，无需手动建库建表。
 
 健康检查：
 
@@ -155,7 +148,7 @@ services:
 
 关闭后仍可使用 ASR 文本唤醒词。
 
-### 3. 启动后端
+### 2. 启动后端
 
 ```bash
 cd backend
@@ -169,7 +162,7 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 curl http://127.0.0.1:8000/health
 ```
 
-### 4. 启动前端
+### 3. 启动前端
 
 ```bash
 cd frontend
@@ -189,10 +182,10 @@ npm run dev
 
 1. VAD 检测到停顿后提交完整语音；
 2. ASR 与 KWS 并行处理；
-3. 冷启动需命中声学 KWS 或配置的文本唤醒词；
-4. 激活窗口内可连续对话；
-5. 后端识别声纹并检查当前会话参与资格；首位唤醒者自动加入，其他新声纹仅进入侦听列表；
-6. 已加入参与人的有效轮次才会调用 Hermes 和流式 TTS。
+3. 后端解析声纹身份（每段语音都会解析，无参与资格门槛）；
+4. 决策模型结合上下文与说话人判断是否回应（normal / brief / silent）；
+5. 命中回应时调用 Hermes 生成回复，并流式 TTS 朗读；
+6. 决策模型异常时回退到唤醒词与连续对话窗口门控。
 
 外放的 TTS 可能被麦克风重新采集，建议开启 VAD 时使用耳机。关闭 VAD 开关后浏览器会释放麦克风。
 
@@ -204,10 +197,9 @@ npm run dev
 | `POST` | `/api/session/start` | 创建本地交互 session，远程 ASR 按需懒启动 |
 | `POST` | `/api/transcribe?session_id=<id>` | 转写 VAD 产生的完整语音片段 |
 | `POST` | `/api/kws/detect` | 调用可选的本地 KWS 服务 |
-| `GET` | `/api/session/{id}` | 查询激活状态、已加入参与人和侦听列表 |
+| `GET` | `/api/session/{id}` | 查询激活状态与侦听到的声音 |
 | `POST` | `/api/session/{id}/turns` | 在 speech-start 创建不可变语音轮次 |
-| `POST` | `/api/session/{id}/turns/{turn_id}/evaluate` | 解析声纹并执行参与资格、唤醒和打断门控 |
-| `POST/DELETE` | `/api/session/{id}/participants/{speaker_id}` | 加入或踢出会话参与人 |
+| `POST` | `/api/session/{id}/turns/{turn_id}/evaluate` | 解析声纹、调用决策模型并执行唤醒/打断门控 |
 | `POST` | `/api/chat` | 消费已获准的 `turn_id` 并发送给 Hermes |
 | `POST` | `/api/touch` | 延长连续对话激活窗口 |
 | `POST` | `/api/tts` | 代理流式 TTS PCM |
@@ -229,3 +221,13 @@ FastAPI 后端还提供声纹用户和模板管理代理接口，详细契约见
 - 声纹服务 API 当前没有认证，只应绑定本机或可信内网，不应直接暴露公网。
 - KWS 与声纹阈值依赖实际设备和环境，默认值不构成准确率或安全保证。
 - KWS 默认 `fail_open: true` 表示服务异常时降级为精确文本唤醒，而不是绕过唤醒门控。
+
+## 更新记录
+
+### 2026-10-20 · 决策模型化 + 去参与者
+
+- **交互决策改为远程生成式决策模型**：移除本地判别式 Laya 后端，统一由 OpenAI 兼容的生成式决策模型判断「是否面向 AI / 是否回应」，默认端点 `http://mo.sy.cn:8000/v1`、模型 `qwen3.6-35b-awq`（可在 `config.yaml` 的 `decision_model` 段更换）。唤醒词强制回应、活跃窗口内延续追问兜底保留；模型异常时回退到唤醒词与连续对话窗口门控。
+- **去掉「参与者」概念**：不再有参与人编号、自动加入、手动加入/踢出，也没有参与资格门槛。开启 VAD 即持续侦听，每段语音都会解析声纹身份并全部流向决策模型，是否回应完全由模型决定。移除 `POST/DELETE /api/session/{id}/participants/{speaker_id}` 端点与 `membership` 字段。
+- **新增决策调度面板**：页面右侧可视化最近一轮的「输入 → 判断 → 结论」全链路（说话人、唤醒事件、会话状态 → 面向 AI、回应类型、置信度、决策来源 → 回应/沉默）。
+- 激活窗口语义调整为由决策模型决定回应时才开启（即"助手回复了才开窗"），不再由唤醒词或加入触发。
+

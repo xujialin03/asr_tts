@@ -57,22 +57,6 @@ export async function evaluateTurn(sessionId, turnId, float32_16k, metadata = {}
   return await jsonResponse(response, "evaluate turn");
 }
 
-export async function joinParticipant(sessionId, speakerId) {
-  const response = await fetch(
-    `${BASE}/session/${encodeURIComponent(sessionId)}/participants/${encodeURIComponent(speakerId)}`,
-    { method: "POST" }
-  );
-  return await jsonResponse(response, "join participant");
-}
-
-export async function removeParticipant(sessionId, speakerId) {
-  const response = await fetch(
-    `${BASE}/session/${encodeURIComponent(sessionId)}/participants/${encodeURIComponent(speakerId)}`,
-    { method: "DELETE" }
-  );
-  return await jsonResponse(response, "remove participant");
-}
-
 export async function transcribeUtterance(sessionId, float32_16k) {
   const response = await fetch(
     `${BASE}/transcribe?session_id=${encodeURIComponent(sessionId)}`,
@@ -101,6 +85,25 @@ export async function touchSession(sessionId, { seconds = null, force = false } 
     body: JSON.stringify({ session_id: sessionId, seconds, force }),
   });
   return await jsonResponse(response, "touch");
+}
+
+export async function recordPerformance(sessionId, event) {
+  const response = await fetch(
+    `${BASE}/session/${encodeURIComponent(sessionId)}/performance`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+    }
+  );
+  if (!response.ok) throw new Error(`performance log failed: ${response.status}`);
+}
+
+export async function getPerformance(sessionId) {
+  const response = await fetch(
+    `${BASE}/session/${encodeURIComponent(sessionId)}/performance`
+  );
+  return await jsonResponse(response, "performance log");
 }
 
 export async function chat(sessionId, turnId) {

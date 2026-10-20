@@ -52,8 +52,27 @@ HERMES_CLIENT_PATH = os.path.expanduser(
 )
 HERMES_TIMEOUT_SECONDS = float(_hermes.get("timeout_seconds", 180))
 
+_agent = _cfg.get("agent", {})
+AGENT_NAME = _agent.get("name", "志玲")
+AGENT_ROLE = _agent.get("role", "语音助理")
+# Persona injected into the decision-model state so the model knows who the
+# assistant is when judging whether a turn is addressed to it. Hermes keeps its
+# own persona in its profile; this copy is only for interaction decisions.
+AGENT_PERSONA = " ".join(str(_agent.get("persona", "")).split()) or (
+    f"你叫{AGENT_NAME}，是一名{AGENT_ROLE}，正在多人语音房间中通过麦克风听取用户发言。"
+)
+
 _assistant = _cfg.get("assistant", {})
 WAKE_WORDS = _assistant.get("wake_words", ["志玲", "志玲姐姐", "姐姐", "小助手"])
+# Continuation-fallback gate: when the decision model marks a participant turn
+# as addressed to the assistant but chooses not to respond, we still reply if the utterance looks
+# like a follow-up question. Markers are interrogative/continuation cues; finals
+# are sentence-final particles that usually signal a question.
+FOLLOWUP_MARKERS = _assistant.get(
+    "followup_markers",
+    ["是不是", "有没有", "能不能", "要不要", "怎么", "为什么", "什么", "多少", "几点", "哪里", "哪个", "哪些", "吗", "呢", "吧"],
+)
+FOLLOWUP_SENTENCE_FINALS = _assistant.get("followup_sentence_finals", ["?", "？", "吗", "呢", "吧", "啊", "呀"])
 ACTIVE_WINDOW_SECONDS = float(_assistant.get("active_window_seconds", 20))
 INTERRUPT_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
@@ -82,3 +101,18 @@ TTS_REF_TEXT = _tts.get("ref_text", "")
 # ref_audio is stored relative to the backend dir (e.g. assets/ref_voice.wav).
 _ref = _tts.get("ref_audio", "")
 TTS_REF_AUDIO = str(Path(__file__).resolve().parent / _ref) if _ref else ""
+
+# Interaction decision model: an OpenAI-compatible generative model that judges
+# whether a turn is addressed to the assistant and whether to reply now.
+_decision_model = _cfg.get("decision_model", {})
+DECISION_MODEL_BASE_URL = _decision_model.get(
+    "base_url", "http://mo.sy.cn:8000/v1"
+)
+DECISION_MODEL_NAME = _decision_model.get("model", "qwen3.6-35b-awq")
+DECISION_MODEL_API_KEY = _decision_model.get("api_key", "")
+DECISION_MODEL_TIMEOUT_SECONDS = float(_decision_model.get("timeout_seconds", 8.0))
+DECISION_MODEL_MAX_TOKENS = int(_decision_model.get("max_tokens", 512))
+# Thinking mode emits a long reasoning trace before the JSON, burning the output
+# budget (truncation) and adding ~3s of latency; disabling it keeps ~1s.
+DECISION_MODEL_ENABLE_THINKING = bool(_decision_model.get("enable_thinking", False))
+DECISION_MODEL_MAX_RETRIES = int(_decision_model.get("max_retries", 3))

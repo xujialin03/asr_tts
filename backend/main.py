@@ -71,6 +71,7 @@ async def _startup() -> None:
                 TTS_REF_BYTES = f.read()
         except OSError:
             TTS_REF_BYTES = None
+    asyncio.create_task(sessions.warmup_decisions())
 
 
 @app.get("/health")
@@ -195,7 +196,7 @@ async def _resolve_speaker(body: bytes) -> dict:
 
 @app.post("/api/voiceprint/resolve")
 async def resolve_voiceprint(request: Request, session_id: str) -> JSONResponse:
-    """Resolve audio for diagnostics without changing conversation membership."""
+    """Resolve audio for diagnostics without affecting the conversation."""
     _get_session(session_id)
     body = await request.body()
     if not body:
@@ -403,14 +404,9 @@ async def evaluate_turn(
         wake_detected = kws_detected or any(
             word and word in text for word in config.WAKE_WORDS
         )
-        needs_identity = (
-            turn.started_while_active
-            or session.is_active()
-            or wake_detected
-            or bool(session.participants)
-        )
+        needs_identity = bool(text) or turn.assistant_speaking
         if not needs_identity:
-            turn = session.reject_turn(turn_id, "未命中唤醒词且会话未激活")
+            turn = session.reject_turn(turn_id, "ASR 未产生有效文本")
         else:
             try:
                 identity = SpeakerIdentity.from_result(await _resolve_speaker(body))
@@ -430,6 +426,7 @@ async def evaluate_turn(
                         kws_detected=kws_detected,
                         kws_keyword=kws_keyword,
                     )
+                    turn = await session.decide_turn(turn)
                 except (KeyError, ValueError) as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -443,23 +440,6 @@ async def evaluate_turn(
         }
     )
     return JSONResponse(result)
-
-
-@app.post("/api/session/{session_id}/participants/{speaker_id}")
-async def join_participant(session_id: str, speaker_id: str) -> JSONResponse:
-    session = _get_session(session_id)
-    participant = session.add_participant(speaker_id)
-    if participant is None:
-        raise HTTPException(status_code=404, detail="observed speaker not found")
-    return JSONResponse(session.snapshot())
-
-
-@app.delete("/api/session/{session_id}/participants/{speaker_id}")
-async def remove_participant(session_id: str, speaker_id: str) -> JSONResponse:
-    session = _get_session(session_id)
-    if session.remove_participant(speaker_id) is None:
-        raise HTTPException(status_code=404, detail="participant not found")
-    return JSONResponse(session.snapshot())
 
 
 class TouchReq(BaseModel):
@@ -480,6 +460,32 @@ async def touch(req: TouchReq) -> JSONResponse:
             "extended": req.force,
         }
     )
+
+
+class PerformanceEventReq(BaseModel):
+    stage: str = Field(min_length=1, max_length=80)
+    elapsed_ms: float = Field(ge=0, le=600_000)
+    turn_id: str | None = None
+    detail: dict = Field(default_factory=dict)
+
+
+@app.post("/api/session/{session_id}/performance", status_code=204)
+async def record_performance(session_id: str, req: PerformanceEventReq) -> Response:
+    session = _get_session(session_id)
+    session.record_performance(
+        req.stage,
+        req.elapsed_ms,
+        source="frontend",
+        turn_id=req.turn_id,
+        detail=req.detail,
+    )
+    return Response(status_code=204)
+
+
+@app.get("/api/session/{session_id}/performance")
+async def session_performance(session_id: str) -> JSONResponse:
+    session = _get_session(session_id)
+    return JSONResponse({"session_id": session.id, "events": session.performance_snapshot()})
 
 
 class ChatReq(BaseModel):
