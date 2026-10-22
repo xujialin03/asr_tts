@@ -255,6 +255,15 @@ let vadTurnPromise = null;
 const vadQueue = [];
 let vadQueueRunning = false;
 const MAX_VAD_QUEUE = 4;
+// When the pipeline stalls (slow ASR/evaluate), segments pile up in the queue.
+// On recovery we drop the stale backlog and process only the newest segment —
+// the conversation has moved on, so replaying old fragments yields confusing
+// replies. A queued segment older than this is treated as stale backlog.
+const VAD_QUEUE_STALE_MS = 6000;
+// Hermes replies run off the VAD pipeline: chained so they stay ordered and
+// one-at-a-time, but never awaited by the drain loop. A slow or hung Hermes call
+// must not stop the mic from transcribing/evaluating the next utterance.
+let replyChain = Promise.resolve();
 
 async function handleEvaluatedTurn(decision, recognizedText) {
   applySessionState(decision.session);
@@ -276,6 +285,9 @@ async function handleEvaluatedTurn(decision, recognizedText) {
     fallback: decision.decision_fallback,
     wake: decision.wake_event,
     interrupt: decision.interrupt,
+    is_complete: decision.is_complete ?? true,
+    buffer_merged: decision.buffer_merged ?? false,
+    buffer: decision.session?.buffer ?? null,
     speaker_id: identity?.speaker_id || "",
     speaker_name: identity
       ? identity.preferred_name || identity.display_name || ""
@@ -297,26 +309,51 @@ async function handleEvaluatedTurn(decision, recognizedText) {
 
   const replyText = (decision.reply_text || recognizedText).trim();
   appendUserMessage(replyText, identity);
-  await sendToLLM(decision.turn_id, identity);
+  // Chain the Hermes reply off the VAD pipeline. The drain loop returns as soon
+  // as the turn is evaluated, so the mic keeps listening even if this reply is
+  // slow or hangs. Chaining keeps replies ordered and one-at-a-time.
+  replyChain = replyChain.then(() => sendToLLM(decision.turn_id, identity));
 }
 
 function queueVadAudio(item) {
-  if (vadQueue.length >= MAX_VAD_QUEUE) {
-    gateNotice.value = "语音处理队列已满，本段未处理";
-    return;
-  }
+  item.queuedAt = Date.now();
   vadQueue.push(item);
+  // Keep-newest ring: if the queue overflows, drop the OLDEST segments so the
+  // freshest speech is always retained.
+  if (vadQueue.length > MAX_VAD_QUEUE) {
+    const dropped = vadQueue.length - MAX_VAD_QUEUE;
+    vadQueue.splice(0, dropped);
+    gateNotice.value = `语音积压，已丢弃较早的 ${dropped} 段`;
+  }
   drainVadQueue();
 }
 
 async function drainVadQueue() {
   if (vadQueueRunning) return;
   vadQueueRunning = true;
-  while (vadQueue.length) {
-    const item = vadQueue.shift();
-    await handleVadAudio(item.audio, item.turnPromise);
+  try {
+    while (vadQueue.length) {
+      // Stall detection: if the OLDEST queued segment has been waiting longer
+      // than the stale window, the pipeline was blocked and speech piled up.
+      // On recovery, drop the stale backlog and process only the newest segment
+      // — the conversation has moved on, so replaying old fragments produces
+      // confusing replies. During normal drain the front item never waits this
+      // long, so this does not fire on a merely-slow queue.
+      if (vadQueue.length > 1 && Date.now() - vadQueue[0].queuedAt > VAD_QUEUE_STALE_MS) {
+        const newest = vadQueue[vadQueue.length - 1];
+        const dropped = vadQueue.length - 1;
+        vadQueue.length = 0;
+        vadQueue.push(newest);
+        gateNotice.value = `语音积压后恢复，已丢弃 ${dropped} 段旧语音，仅处理最新一段`;
+      }
+      const item = vadQueue.shift();
+      await handleVadAudio(item.audio, item.turnPromise);
+    }
+  } finally {
+    // Always release the lock: an unexpected throw must not permanently stall
+    // the pipeline (otherwise every later utterance is queued but never run).
+    vadQueueRunning = false;
   }
-  vadQueueRunning = false;
 }
 
 async function handleVadAudio(audio, turnPromise) {
@@ -630,6 +667,30 @@ onBeforeUnmount(() => {
               <template v-if="decisionDebug.active_remaining != null">
                 · {{ decisionDebug.active_remaining }}s
               </template>
+            </span>
+          </div>
+        </section>
+
+        <div class="dp-arrow">↓</div>
+
+        <!-- 输入缓冲区 -->
+        <section class="dp-stage dp-buffer">
+          <div class="dp-stage-head"><span class="dp-badge">B</span><h3>输入缓冲区</h3></div>
+          <div class="dp-grid">
+            <span class="dp-k">本轮合并</span>
+            <span :class="['dp-v', decisionDebug.buffer_merged ? 'dp-yes' : 'dp-no']">
+              {{ decisionDebug.buffer_merged ? "已合并前序残句" : "未合并" }}
+            </span>
+            <span class="dp-k">是否说完</span>
+            <span :class="['dp-v', decisionDebug.is_complete ? 'dp-yes' : 'dp-no']">
+              {{ decisionDebug.is_complete ? "已说完" : "未说完（残句）" }}
+            </span>
+            <span class="dp-k">缓冲区</span>
+            <span :class="['dp-v', decisionDebug.buffer ? 'dp-no' : '']">
+              <template v-if="decisionDebug.buffer">
+                等待合并 · {{ decisionDebug.buffer.segments }} 段 · “{{ decisionDebug.buffer.text }}” · {{ decisionDebug.buffer.waiting_seconds }}s
+              </template>
+              <template v-else>空</template>
             </span>
           </div>
         </section>
@@ -1277,6 +1338,7 @@ button:disabled {
   background: #64748b;
 }
 .dp-input .dp-badge { background: #2563eb; }
+.dp-buffer .dp-badge { background: #0891b2; }
 .dp-judge .dp-badge { background: #7c3aed; }
 .dp-result .dp-badge { background: #16a34a; }
 .dp-result.is-silent .dp-badge { background: #94a3b8; }

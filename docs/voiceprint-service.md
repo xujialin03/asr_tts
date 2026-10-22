@@ -55,10 +55,14 @@ Content-Type: application/octet-stream
 Body: float32 PCM, 16 kHz, mono
 ```
 
-- 匹配到已有声纹：返回原有 `speaker_id`，`created: false`。
-- 没有达到匹配阈值：在一个数据库事务中创建匿名用户及首个声纹模板，返回新 `speaker_id`，`created: true`。
-- 未通过唤醒门控的环境语音不会创建身份。
-- 身份创建由程序完成；Hermes 后续可以用 `speaker_id` 补充姓名、称呼和偏好，但不负责判定声纹是否相同。
+- 匹配到已有声纹（`score >= accept_threshold`）：返回原有 `speaker_id`，`created: false`，`decision: "matched"`。
+- 落在不确定区间（`uncertain_threshold <= score < accept_threshold`）：判定为**老用户声音漂移**（离麦远、嗓音状态变化等），默认把这段作为该身份的**又一个声纹模板**追加（`auto_enroll_uncertain=true`，见 `app/settings.py`），返回同一 `speaker_id`、`created: false`、`decision: "uncertain"`、`template_added: true`。这样同一个人越用越容易被认出，不会被重新建档成"访客"、导致助手反复追问身份。把 `auto_enroll_uncertain` 设为 `false` 可退回"不确定也新建"的旧行为。
+- 低于不确定阈值（`score < uncertain_threshold`）或库为空：在一个数据库事务中创建匿名用户及首个声纹模板，返回新 `speaker_id`、`created: true`、`decision: "unknown"`。
+- 未通过唤醒门控的环境语音不会调用解析，自然也不会建档。
+- 身份建档由程序完成；Hermes 后续可以用 `speaker_id` 补充姓名、称呼和偏好，但不负责判定声纹是否相同。
+
+> 冷启动：库为空时第一段被解析的声音即被建档为第一个身份（`created: true`），后续该人说话走 matched/uncertain。无需预先建档或 UI 登记——见下文"唤醒问候与姓名绑定"。
+
 
 示例响应：
 
@@ -106,6 +110,23 @@ python3 backend/voiceprintctl.py list
 python3 backend/voiceprintctl.py show --speaker-id '<speaker_id>'
 python3 backend/voiceprintctl.py templates --speaker-id '<speaker_id>'
 ```
+
+### 直连 LLM 模式的项目内声纹技能
+
+当 `config.yaml` 的 `conversation.provider` 设为 `direct_llm` 时，不经过 Hermes；backend 会把受限的项目内 `voiceprint-management` skill 以 JSON action 契约提供给模型。
+
+当前只开放一个低风险动作：
+
+```text
+voiceprint.set_current_preferred_name(preferred_name)
+```
+
+- 仅当用户明确自报称呼（“我叫 X”“叫我 X”）时模型才可请求该动作；
+- skill 的目标 `speaker_id` 由 backend 绑定为**当前已经通过声纹门控的 turn**，模型不能传入、更换或枚举任意身份；
+- backend 校验称呼格式后，通过声纹服务 `PATCH /v1/users/{current_speaker_id}` 持久化 `preferred_name`，并同步当前 Session；
+- 不开放删除用户、删除模板、添加模板、查询其他身份等动作；这些仍需 Hermes skill 或人工 CLI 管理。
+
+因此直连模式也支持完整的自然闭环：匿名访客被唤醒 → 志玲问一次称呼 → 用户说“我是许老板” → 立即存为 `preferred_name: "许老板"` → 后续识别到同一声纹会使用该称呼。
 
 ### 唤醒问候与姓名绑定
 

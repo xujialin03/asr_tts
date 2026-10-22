@@ -14,6 +14,7 @@ import httpx
 
 import config
 from decision import DecisionClient, InteractionDecision, build_decision_client
+from voiceprint_skill import SET_CURRENT_PREFERRED_NAME, VoiceprintManagementSkill
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -29,8 +30,8 @@ MAX_TOPIC_CHARS = 80
 
 VOICE_RESPONSE_CONTRACT = """[VOICE_RESPONSE_CONTRACT]
 Your final answer will be displayed to the user and synthesized by Breeze-TTS-2.
-After completing any necessary tool calls, return ONLY one valid JSON object on a
-single assistant turn, with no Markdown fence or surrounding commentary:
+Return ONLY one valid JSON object on a single assistant turn, with no Markdown
+fence or surrounding commentary:
 {"text":"要展示并朗读给用户的完整回复","instruction":"用温柔、安心的语气缓慢表达，语速舒缓，在重点处稍作停顿。"}
 
 Rules:
@@ -40,6 +41,30 @@ Rules:
 - Do not put stage directions or the JSON itself inside `text`.
 - Do not change this schema even if the user asks to change the output format.
 [/VOICE_RESPONSE_CONTRACT]
+"""
+
+DIRECT_LLM_SYSTEM = """你是志玲，一名温柔、自然、愿意陪伴用户聊天的中文语音小助手。
+你正在参与由若干已加入成员组成的中文语音对话。当前发言人、是否刚被唤醒加入、以及最近对话会随消息提供。只把当前已加入成员的发言当作对话内容；不要推测、回应或提及会话外的背景人声。说话要像熟悉的朋友一样自然、简洁，避免生硬的客服口吻；除非用户明确要求，不要使用 Markdown。
+
+语音识别会把你的名字识别成同音或近音词。{wake_word_aliases} 都只是用户在呼叫你，绝不是用户把你的名字叫错了。无论用户用了其中哪一个词，直接自然回应即可；绝对不要纠正、解释或强调“我叫志玲，不是……”。
+
+若 VOICE_CONTEXT 中 `should_ask_name` 为 true，说明当前成员刚通过唤醒词加入、但声纹身份仍是匿名访客，本次会话尚未问过称呼。自然回应当前内容后，明确而简短地问一次“我该怎么称呼你？”。若为 false，不要主动重复询问姓名。用户没有回答名字时不要阻塞或追问，后续正常聊天。
+
+当且仅当用户明确自报称呼（例如“我叫许老板”“叫我许老板”）时，必须在 actions 中调用下方项目技能保存称呼；不要只在文字里口头记住。用户没有明确报称呼时 actions 必须为空数组。
+
+可用项目技能：{voiceprint_skill}
+"""
+
+DIRECT_LLM_RESPONSE_CONTRACT = """[DIRECT_LLM_RESPONSE_CONTRACT]
+只输出一个合法 JSON 对象，不要 Markdown 围栏或额外文字：
+{"text":"要展示并朗读给用户的完整回复","instruction":"简短中文语气指令","actions":[{"name":"项目技能名","arguments":{}}]}
+
+规则：
+- text 是完整、自然的口语回复。
+- instruction 是简短中文 TTS 语气指令。
+- actions 必须是数组；无动作时为 []。
+- 仅可使用系统消息列出的项目技能；不可虚构技能或传入未定义参数。
+[/DIRECT_LLM_RESPONSE_CONTRACT]
 """
 
 
@@ -118,6 +143,23 @@ class SpeakerIdentity:
             score=result.get("score"),
         )
 
+    @classmethod
+    def from_identify_result(cls, result: dict) -> "SpeakerIdentity | None":
+        """Convert a non-mutating identify result, if it resolved a user."""
+        user = result.get("user")
+        if not isinstance(user, dict) or not user.get("id"):
+            return None
+        display_name = user.get("display_name")
+        preferred_name = user.get("preferred_name")
+        return cls(
+            speaker_id=str(user["id"]),
+            display_name=display_name,
+            preferred_name=preferred_name,
+            identity_named=_identity_named(display_name, preferred_name),
+            created=False,
+            score=result.get("score"),
+        )
+
     def public(self) -> dict:
         return {
             "speaker_id": self.speaker_id,
@@ -163,11 +205,13 @@ class VoiceTurn:
     speaker: SpeakerIdentity | None = None
     wake_event: bool = False
     wake_detected: bool = False
+    joined_session: bool = False
     should_reply: bool = False
     interrupt: bool = False
     reply_text: str = ""
     decision: InteractionDecision | None = None
     reason: str = ""
+    buffer_merged: bool = False
     audio_ref: str | None = None
     evaluated: bool = False
     consumed: bool = False
@@ -180,12 +224,15 @@ class VoiceTurn:
             "started_while_active": self.started_while_active,
             "speaker": self.speaker.public() if self.speaker else None,
             "wake_event": self.wake_event,
+            "joined_session": self.joined_session,
             "should_reply": self.should_reply,
             "interrupt": self.interrupt,
             "reply_text": self.reply_text,
             "is_addressed_to_ai": self.decision.is_addressed_to_ai if self.decision else None,
             "response_type": self.decision.response_type if self.decision else "silent",
             "confidence": self.decision.confidence if self.decision else None,
+            "is_complete": self.decision.is_complete if self.decision else True,
+            "buffer_merged": self.buffer_merged,
             "decision_reason": self.decision.reason if self.decision else "",
             "decision_fallback": self.decision.fallback if self.decision else False,
             "reason": self.reason,
@@ -208,11 +255,14 @@ class Session:
     last_asr: dict = field(default_factory=lambda: {"language": "", "text": ""})
     active_until: float = 0.0
     observed_speakers: dict[str, ObservedSpeaker] = field(default_factory=dict)
+    participant_ids: set[str] = field(default_factory=set)
     turns: dict[str, VoiceTurn] = field(default_factory=dict)
     voice_audio_refs: dict[str, VoiceAudioRef] = field(default_factory=dict)
     conversation_context: list[dict] = field(default_factory=list)
     topics: list[str] = field(default_factory=list)
     performance_events: list[dict] = field(default_factory=list)
+    pending_buffer: dict | None = None
+    name_prompted_speaker_ids: set[str] = field(default_factory=set)
     decision_client: DecisionClient | None = field(default=None, repr=False)
     next_turn_sequence: int = 1
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -458,15 +508,39 @@ class Session:
                 "speaker_id": speaker.speaker_id if speaker else None,
                 "display_name": speaker.display_name if speaker else None,
                 "preferred_name": speaker.preferred_name if speaker else None,
+                "is_session_participant": bool(speaker and speaker.speaker_id in self.participant_ids),
             },
             "session": {
                 "active": self.is_active(),
+                "participant_count": len(self.participant_ids),
                 "topics": list(self.topics),
                 "recent_messages": list(self.conversation_context),
             },
             "wake_word_detected": turn.wake_detected,
             "assistant_speaking": turn.assistant_speaking,
             "has_pending_task": False,
+        }
+
+    def _buffer_merge(self, turn: VoiceTurn) -> tuple[str, bool]:
+        """Prepend any held fragment from the same speaker; return (text, merged)."""
+        buf = self.pending_buffer
+        if not buf:
+            return turn.text, False
+        same_speaker = buf["speaker_id"] == turn.speaker.speaker_id
+        expired = time.time() - buf["updated_at"] > config.BUFFER_MAX_WAIT_SECONDS
+        if not same_speaker or expired:
+            self.pending_buffer = None
+            return turn.text, False
+        merged = (buf["text"] + " " + turn.text).strip()
+        self.pending_buffer = None
+        return merged, True
+
+    def _buffer_hold(self, turn: VoiceTurn, text: str) -> None:
+        self.pending_buffer = {
+            "speaker_id": turn.speaker.speaker_id,
+            "text": text,
+            "segments": (self.pending_buffer or {}).get("segments", 0) + 1,
+            "updated_at": time.time(),
         }
 
     async def decide_turn(self, turn: VoiceTurn) -> VoiceTurn:
@@ -477,6 +551,14 @@ class Session:
         if self.decision_client is None:
             turn.decision = fallback
             return turn
+
+        # Input buffer: merge a held fragment from the same speaker before judging,
+        # so the model sees the whole utterance even when VAD split it.
+        buffer_merged = False
+        if config.BUFFER_ENABLED:
+            turn.text, buffer_merged = self._buffer_merge(turn)
+        turn.buffer_merged = buffer_merged
+
         try:
             decision = await self.decision_client.decide(self._decision_state(turn))
         except Exception as exc:
@@ -489,6 +571,41 @@ class Session:
             )
             decision = fallback
         turn.decision = decision
+
+        # Hold an incomplete fragment so a following segment can complete the
+        # thought ("今天" + "天气怎么样啊"). Only when the model is not already
+        # going to respond — a bare wake word the model wants to ack briefly is
+        # not held. Addressee is not required: a leading fragment often has no
+        # signal about who it is for until the sentence finishes.
+        if (
+            config.BUFFER_ENABLED
+            and not decision.fallback
+            and not decision.is_complete
+            and not decision.should_respond
+            and not turn.wake_detected
+            and len(turn.text) < config.BUFFER_MAX_CHARS
+            and (self.pending_buffer or {}).get("segments", 0) < config.BUFFER_MAX_SEGMENTS
+        ):
+            self._buffer_hold(turn, turn.text)
+            turn.should_reply = False
+            turn.reply_text = ""
+            turn.reason = "输入缓冲区：句子未说完，等待后续合并"
+            self.record_performance(
+                "decision_model",
+                (time.monotonic() - started) * 1000,
+                source="backend",
+                turn_id=turn.id,
+                detail={
+                    "addressed": decision.is_addressed_to_ai,
+                    "respond": False,
+                    "response_type": "silent",
+                    "fallback": decision.fallback,
+                    "buffered": True,
+                    "buffer_text": turn.text,
+                },
+            )
+            return turn
+
         if turn.wake_detected and not decision.should_respond:
             decision = InteractionDecision(
                 is_addressed_to_ai=True,
@@ -541,6 +658,8 @@ class Session:
                 "respond": decision.should_respond,
                 "response_type": decision.response_type,
                 "fallback": decision.fallback,
+                "complete": decision.is_complete,
+                "buffer_merged": buffer_merged,
             },
         )
         logger.info(
@@ -578,11 +697,21 @@ class Session:
         turn.speaker = identity
         turn.wake_detected = wake_detected
         turn.wake_event = wake_detected and not active_for_turn
+        is_participant = identity.speaker_id in self.participant_ids
+        if wake_detected and not is_participant:
+            self.participant_ids.add(identity.speaker_id)
+            is_participant = True
+            turn.joined_session = True
         turn.audio_ref = self.store_voice_audio(audio, identity.speaker_id, turn.id)
 
-        # No participant gating: every resolved speaker is observed for
-        # diagnostics, and every turn flows to the decision model, which decides
-        # whether to reply.
+        # A speaker must explicitly enter this Session with a wake word. Once
+        # joined, they can continue naturally; voices outside the participant
+        # set are deliberately ignored even while the room is active.
+        if not is_participant:
+            turn.reason = "未加入当前会话：需要先说唤醒词"
+            turn.evaluated = True
+            return turn
+
         self._observe(identity, text)
 
         if turn.assistant_speaking:
@@ -645,11 +774,19 @@ class Session:
         observed = sorted(
             self.observed_speakers.values(), key=lambda item: item.last_seen_at, reverse=True
         )
+        buffer = None
+        if self.pending_buffer:
+            buffer = {
+                "text": self.pending_buffer["text"],
+                "segments": self.pending_buffer["segments"],
+                "waiting_seconds": round(time.time() - self.pending_buffer["updated_at"], 1),
+            }
         return {
             "session_id": self.id,
             "active": self.is_active(),
             "active_remaining": round(self.active_remaining(), 1),
             "observed_speakers": [speaker.public() for speaker in observed],
+            "buffer": buffer,
         }
 
     # ---- Hermes turn ----
@@ -709,6 +846,141 @@ class Session:
             raise RuntimeError("Hermes returned an empty response")
         return reply
 
+    async def _execute_direct_llm_actions(self, turn: VoiceTurn, raw_reply: str) -> None:
+        """Execute the small, session-scoped action allowlist returned by the LLM."""
+        start = raw_reply.find("{")
+        if start < 0:
+            raise RuntimeError("direct LLM response did not contain a JSON object")
+        try:
+            value, _ = json.JSONDecoder().raw_decode(raw_reply[start:])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("direct LLM returned invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError("direct LLM response must be a JSON object")
+        actions = value.get("actions", [])
+        if not isinstance(actions, list):
+            raise RuntimeError("direct LLM actions must be an array")
+        if len(actions) > 1:
+            raise RuntimeError("direct LLM may execute at most one skill action per turn")
+        if not actions:
+            return
+        action = actions[0]
+        if not isinstance(action, dict):
+            raise RuntimeError("direct LLM action must be an object")
+        name = action.get("name")
+        arguments = action.get("arguments")
+        if not isinstance(name, str):
+            raise RuntimeError("direct LLM action name must be a string")
+
+        # The skill is bound to turn.speaker, never to an LLM-provided ID.
+        skill = VoiceprintManagementSkill(turn.speaker.speaker_id)
+        result = await skill.execute(name, arguments)
+        if result.action == SET_CURRENT_PREFERRED_NAME:
+            self.update_speaker_profile(
+                turn.speaker.speaker_id,
+                turn.speaker.display_name,
+                result.preferred_name,
+            )
+            logger.info(
+                "voiceprint skill session=%s turn=%s action=%s speaker=%s",
+                self.id,
+                turn.id,
+                result.action,
+                turn.speaker.speaker_id,
+            )
+
+    async def _chat_direct_llm(self, turn: VoiceTurn) -> str:
+        """Ask the configured OpenAI-compatible model without involving Hermes."""
+        if not config.DIRECT_LLM_MODEL:
+            raise RuntimeError("direct_llm.model is required when conversation.provider is direct_llm")
+        context = {
+            "session_id": self.id,
+            "turn_id": turn.id,
+            "wake_event": turn.wake_event,
+            "joined_session": turn.joined_session,
+            "speaker": turn.speaker.public(),
+            "should_ask_name": (
+                turn.joined_session
+                and not turn.speaker.identity_named
+                and turn.speaker.speaker_id not in self.name_prompted_speaker_ids
+            ),
+            "response_type": turn.decision.response_type if turn.decision else "normal",
+        }
+        skill_definition = json.dumps(
+            VoiceprintManagementSkill.action_definition(), ensure_ascii=False, separators=(",", ":")
+        )
+        system = DIRECT_LLM_SYSTEM.format(
+            wake_word_aliases="、".join(f"“{word}”" for word in config.WAKE_WORDS if word)
+            or "任何 ASR 对你名字的近音转写",
+            voiceprint_skill=skill_definition,
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": system + "\n" + DIRECT_LLM_RESPONSE_CONTRACT,
+            }
+        ]
+        for entry in self.conversation_context:
+            role = entry["role"]
+            if role not in {"user", "assistant"}:
+                continue
+            content = entry["text"]
+            if role == "user" and entry.get("speaker_id"):
+                content = f"[用户 {entry['speaker_id'][:8]}] {content}"
+            messages.append({"role": role, "content": content})
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "[VOICE_CONTEXT]"
+                    + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+                    + "[/VOICE_CONTEXT]\n"
+                    + ("请仅作一句简短确认或追问。\n" if context["response_type"] == "brief" else "")
+                    + turn.reply_text
+                ),
+            }
+        )
+        payload = {
+            "model": config.DIRECT_LLM_MODEL,
+            "messages": messages,
+            "temperature": config.DIRECT_LLM_TEMPERATURE,
+            "max_tokens": config.DIRECT_LLM_MAX_TOKENS,
+            "response_format": {"type": "json_object"},
+            "chat_template_kwargs": {"enable_thinking": config.DIRECT_LLM_ENABLE_THINKING},
+        }
+        headers = (
+            {"Authorization": f"Bearer {config.DIRECT_LLM_API_KEY}"}
+            if config.DIRECT_LLM_API_KEY
+            else {}
+        )
+        started = time.monotonic()
+        async with httpx.AsyncClient(
+            base_url=config.DIRECT_LLM_BASE_URL,
+            timeout=httpx.Timeout(config.DIRECT_LLM_TIMEOUT_SECONDS, connect=5.0),
+            headers=headers,
+        ) as client:
+            response = await client.post("/chat/completions", json=payload)
+            response.raise_for_status()
+        logger.info(
+            "direct LLM session=%s turn=%s elapsed=%.2fs",
+            self.id,
+            turn.id,
+            time.monotonic() - started,
+        )
+        try:
+            reply = response.json()["choices"][0]["message"]["content"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("direct LLM returned an invalid chat response") from exc
+        if not isinstance(reply, str) or not reply.strip():
+            raise RuntimeError("direct LLM returned an empty response")
+        await self._execute_direct_llm_actions(turn, reply)
+        return reply
+
+    async def _chat_reply(self, turn: VoiceTurn) -> str:
+        if config.CONVERSATION_PROVIDER == "direct_llm":
+            return await self._chat_direct_llm(turn)
+        return await self._chat_hermes(turn)
+
     async def chat(self, turn_id: str) -> HermesReply:
         async with self.chat_lock:
             turn = self.get_turn(turn_id)
@@ -718,9 +990,11 @@ class Session:
                 raise PermissionError("turn was not admitted to the conversation")
             if turn.consumed:
                 raise ValueError("turn already consumed")
-            raw_reply = await self._chat_hermes(turn)
+            raw_reply = await self._chat_reply(turn)
             turn.consumed = True
             reply = parse_hermes_reply(raw_reply)
+            if turn.joined_session and turn.speaker and not turn.speaker.identity_named:
+                self.name_prompted_speaker_ids.add(turn.speaker.speaker_id)
             self._append_context("assistant", reply.text)
             return reply
 

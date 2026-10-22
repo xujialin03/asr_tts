@@ -38,6 +38,14 @@ INTERACTION_DECISION_SCHEMA = {
             "enum": ["normal", "brief", "silent"],
             "description": "normal, brief, or silent.",
         },
+        "is_complete": {
+            "type": "boolean",
+            "description": (
+                "Whether the current message is a complete utterance. False when it "
+                "looks like a fragment cut off by a pause (e.g. '今天' or a trailing "
+                "wake word) that should wait for the speaker to finish."
+            ),
+        },
         "confidence": {
             "type": "number",
             "minimum": 0,
@@ -74,15 +82,19 @@ class InteractionDecision:
     response_type: str
     confidence: float
     reason: str
+    is_complete: bool = True
     fallback: bool = False
 
     @classmethod
     def from_value(cls, value: Any) -> "InteractionDecision":
         if not isinstance(value, dict):
             raise ValueError("decision model output must be an object")
-        expected = set(INTERACTION_DECISION_SCHEMA["required"])
-        if set(value) != expected:
-            raise ValueError("decision model output does not match schema")
+        required = set(INTERACTION_DECISION_SCHEMA["required"])
+        allowed = set(INTERACTION_DECISION_SCHEMA["properties"])
+        if not required.issubset(value):
+            raise ValueError("decision model output is missing required fields")
+        if not set(value).issubset(allowed):
+            raise ValueError("decision model output has unknown fields")
         if not isinstance(value["is_addressed_to_ai"], bool):
             raise ValueError("is_addressed_to_ai must be a boolean")
         if not isinstance(value["should_respond"], bool):
@@ -98,6 +110,11 @@ class InteractionDecision:
         reason = value["reason"]
         if not isinstance(reason, str):
             raise ValueError("reason must be a string")
+        # Optional: default to complete so a model that omits it degrades to the
+        # pre-buffer behavior (reply immediately) instead of stalling.
+        is_complete = value.get("is_complete", True)
+        if not isinstance(is_complete, bool):
+            raise ValueError("is_complete must be a boolean")
         should_respond = value["should_respond"]
         if not should_respond:
             response_type = "silent"
@@ -109,6 +126,7 @@ class InteractionDecision:
             response_type=response_type,
             confidence=float(confidence),
             reason=reason.strip()[:200],
+            is_complete=is_complete,
         )
 
 
@@ -121,11 +139,12 @@ class DecisionClient(Protocol):
 # assistant's name (诗林/志宁/志凌 → 志玲) instead of relying on wake-word strings.
 DECISION_MODEL_SYSTEM = """你是语音助手交互决策器。当前助手人设：__PERSONA__
 根据 state 判断，只输出一个 JSON 对象，不要多余文字：
-{"is_addressed_to_ai":bool,"should_respond":bool,"response_type":"normal|brief|silent","confidence":0~1,"reason":"简短中文理由"}
+{"is_addressed_to_ai":bool,"should_respond":bool,"response_type":"normal|brief|silent","is_complete":bool,"confidence":0~1,"reason":"简短中文理由"}
 规则：
 - 人类之间互相聊天、自言自语、与助手无关→is_addressed_to_ai=false,should_respond=false,response_type=silent。
 - 对助手说话、呼叫助手（含同音误识别的名字）、或延续助手上一轮话题→should_respond=true。
-- is_addressed_to_ai=false 时 should_respond 必须为 false。"""
+- is_addressed_to_ai=false 时 should_respond 必须为 false。
+- is_complete 表示这句话是否已经说完：明显是停顿切开的残句（如只有"今天"、以唤醒词结尾、句子明显没说完）→is_complete=false；完整问句或陈述→is_complete=true。"""
 
 
 def _extract_json(text: str) -> dict:

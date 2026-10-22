@@ -42,6 +42,9 @@ assistant:
     - 志玲
     - 志玲姐姐
     - 志宁
+    - 志凌
+    - 诗林
+    - 志林
     - 姐姐
     - 小助手
   active_window_seconds: 20
@@ -74,6 +77,14 @@ assistant:
     - "吧"
   followup_sentence_finals: ["?", "？", "吗", "呢", "吧", "啊", "呀"]
 
+# 输入缓冲区：VAD 停顿会把一句话切成多段。决策模型判为“未说完”的残句会暂存，
+# 等待同一说话人的后续片段合并成完整句子后再发给 Hermes。
+buffer:
+  enabled: true
+  max_wait_seconds: 3.0   # 超过此时长未等到后续片段，则放弃合并、按原样处理
+  max_segments: 4         # 最多合并几段
+  max_chars: 200          # 合并后文本超过此长度则不再等待
+
 # 交互决策模型：OpenAI 兼容生成式模型，判断“是否面向 AI / 是否回应”。
 decision_model:
   base_url: http://mo.sy.cn:8000/v1
@@ -84,6 +95,21 @@ decision_model:
   # 关闭思考：思考模式会把输出预算烧光导致 JSON 截断，且延迟 ~3s；关思考 ~1s。
   enable_thinking: false
   max_retries: 3
+
+# Reply provider: use "hermes" for the dedicated agent, or "direct_llm" to
+# call an OpenAI-compatible chat model directly (without Hermes tools/skills).
+conversation:
+  provider: hermes
+
+# Required only when conversation.provider is direct_llm.
+direct_llm:
+  base_url: http://127.0.0.1:9090/v1
+  model: your-model-id
+  # api_key: ""
+  timeout_seconds: 30
+  max_tokens: 512
+  temperature: 0.7
+  enable_thinking: false
 
 hermes:
   # Client for the dedicated Hermes agent. Hermes owns conversation history

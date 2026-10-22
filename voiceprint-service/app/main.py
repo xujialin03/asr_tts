@@ -221,19 +221,62 @@ async def delete_voiceprint(user_id: UUID, voiceprint_id: UUID) -> Response:
 async def resolve_speaker(
     request: Request,
     accept_threshold: float = Query(default=settings.identify_threshold),
+    uncertain_threshold: float = Query(default=settings.uncertain_threshold),
 ) -> dict[str, Any]:
-    """Resolve an utterance to a stable speaker ID, creating one when unknown."""
-    if not -1 <= accept_threshold <= 1:
-        raise HTTPException(status_code=422, detail="accept_threshold must be between -1 and 1")
+    """Resolve an utterance to a stable speaker ID, creating one when unknown.
+
+    Three bands drive the outcome (see ``_decision``):
+    - ``matched`` (score >= accept): return the existing identity.
+    - ``uncertain`` (uncertain <= score < accept): the speaker is probably a
+      returning user whose voice drifted below the accept bar. When
+      ``auto_enroll_uncertain`` is on, append this segment as another template
+      to that identity so recognition self-improves instead of spawning a fresh
+      anonymous speaker (which would make the assistant re-ask who they are).
+    - ``unknown`` (score < uncertain, or no candidates): create an anonymous
+      speaker and its first template.
+    """
+    if not -1 <= uncertain_threshold <= accept_threshold <= 1:
+        raise HTTPException(
+            status_code=422,
+            detail="thresholds must satisfy -1 <= uncertain_threshold <= accept_threshold <= 1",
+        )
     query, audio = await _audio_embedding(request)
 
     async with RESOLVE_LOCK:
         match = _best_match(query, await database.active_embeddings())
-        if match is not None and match[0] >= accept_threshold:
+        score = match[0] if match is not None else -1.0
+        decision = (
+            _decision(score, accept_threshold, uncertain_threshold)
+            if match is not None
+            else "unknown"
+        )
+
+        if decision == "matched":
             score, candidate = match
             return {
                 "speaker_id": candidate["user_id"],
                 "created": False,
+                "decision": "matched",
+                "score": round(score, 6),
+                "speaker": _public_speaker(candidate),
+                **audio["quality"],
+                "duration_ms": audio["duration_ms"],
+            }
+
+        if decision == "uncertain" and settings.auto_enroll_uncertain:
+            score, candidate = match
+            added = await database.add_voiceprint(
+                candidate["user_id"],
+                "auto-uncertain",
+                query,
+                **audio,
+            )
+            return {
+                "speaker_id": candidate["user_id"],
+                "created": False,
+                "decision": "uncertain",
+                "template_added": True,
+                "voiceprint_id": added["id"],
                 "score": round(score, 6),
                 "speaker": _public_speaker(candidate),
                 **audio["quality"],
@@ -247,7 +290,8 @@ async def resolve_speaker(
         return {
             "speaker_id": speaker["id"],
             "created": True,
-            "score": round(match[0], 6) if match is not None else None,
+            "decision": "unknown",
+            "score": round(score, 6) if match is not None else None,
             "speaker": {
                 "id": speaker["id"],
                 "username": speaker["username"],

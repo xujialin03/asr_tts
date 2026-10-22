@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     max_audio_seconds: float = 30.0
     identify_threshold: float = 0.55
     uncertain_threshold: float = 0.45
+    # When resolve scores a segment in the uncertain band against an existing
+    # identity, treat it as the same person and append the segment as an extra
+    # template instead of creating a new anonymous speaker. Makes a returning
+    # user progressively easier to recognize (self-improving enrollment).
+    auto_enroll_uncertain: bool = True
 
 
 settings = Settings()

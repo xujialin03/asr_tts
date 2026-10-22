@@ -52,6 +52,23 @@ HERMES_CLIENT_PATH = os.path.expanduser(
 )
 HERMES_TIMEOUT_SECONDS = float(_hermes.get("timeout_seconds", 180))
 
+# Conversation replies can be served by the dedicated Hermes worker or directly
+# by an OpenAI-compatible model. The latter is useful while the Hermes worker is
+# unavailable; it retains only backend session context and cannot run Hermes
+# skills (such as persistent voice-profile naming).
+_conversation = _cfg.get("conversation", {})
+CONVERSATION_PROVIDER = _conversation.get("provider", "hermes")
+if CONVERSATION_PROVIDER not in {"hermes", "direct_llm"}:
+    raise ValueError("conversation.provider must be 'hermes' or 'direct_llm'")
+_direct_llm = _cfg.get("direct_llm", {})
+DIRECT_LLM_BASE_URL = _direct_llm.get("base_url", "http://127.0.0.1:9090/v1").rstrip("/")
+DIRECT_LLM_MODEL = _direct_llm.get("model", "")
+DIRECT_LLM_API_KEY = _direct_llm.get("api_key", "")
+DIRECT_LLM_TIMEOUT_SECONDS = float(_direct_llm.get("timeout_seconds", 30))
+DIRECT_LLM_MAX_TOKENS = int(_direct_llm.get("max_tokens", 512))
+DIRECT_LLM_TEMPERATURE = float(_direct_llm.get("temperature", 0.7))
+DIRECT_LLM_ENABLE_THINKING = bool(_direct_llm.get("enable_thinking", False))
+
 _agent = _cfg.get("agent", {})
 AGENT_NAME = _agent.get("name", "志玲")
 AGENT_ROLE = _agent.get("role", "语音助理")
@@ -74,6 +91,16 @@ FOLLOWUP_MARKERS = _assistant.get(
 )
 FOLLOWUP_SENTENCE_FINALS = _assistant.get("followup_sentence_finals", ["?", "？", "吗", "呢", "吧", "啊", "呀"])
 ACTIVE_WINDOW_SECONDS = float(_assistant.get("active_window_seconds", 20))
+
+# Input buffer: VAD pauses can split one utterance into several ASR segments.
+# When the decision model flags a segment as an incomplete fragment, we hold it
+# and merge following segments from the same speaker until the utterance is
+# complete or the buffer times out.
+_buffer = _cfg.get("buffer", {})
+BUFFER_ENABLED = bool(_buffer.get("enabled", True))
+BUFFER_MAX_WAIT_SECONDS = float(_buffer.get("max_wait_seconds", 3.0))
+BUFFER_MAX_SEGMENTS = int(_buffer.get("max_segments", 4))
+BUFFER_MAX_CHARS = int(_buffer.get("max_chars", 200))
 INTERRUPT_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in _assistant.get(

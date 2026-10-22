@@ -194,6 +194,30 @@ async def _resolve_speaker(body: bytes) -> dict:
         ) from exc
 
 
+async def _identify_speaker(body: bytes) -> dict:
+    """Identify audio without creating a user or adding a voiceprint."""
+    try:
+        response = await client.post(
+            f"{config.VOICEPRINT_BASE_URL}/v1/identify",
+            content=body,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=httpx.Timeout(30.0, connect=5.0),
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500]
+        raise HTTPException(
+            status_code=502,
+            detail=f"voiceprint identify failed: {exc.response.status_code} {detail}",
+        ) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"voiceprint identify failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
 @app.post("/api/voiceprint/resolve")
 async def resolve_voiceprint(request: Request, session_id: str) -> JSONResponse:
     """Resolve audio for diagnostics without affecting the conversation."""
@@ -404,31 +428,42 @@ async def evaluate_turn(
         wake_detected = kws_detected or any(
             word and word in text for word in config.WAKE_WORDS
         )
-        needs_identity = bool(text) or turn.assistant_speaking
-        if not needs_identity:
+        if not text:
             turn = session.reject_turn(turn_id, "ASR 未产生有效文本")
         else:
             try:
-                identity = SpeakerIdentity.from_result(await _resolve_speaker(body))
+                # Only an explicit wake may resolve/create an identity. Ordinary
+                # ambient speech uses identify, which is read-only and therefore
+                # cannot fill the database with anonymous visitors.
+                if wake_detected:
+                    identity = SpeakerIdentity.from_result(await _resolve_speaker(body))
+                else:
+                    identity = SpeakerIdentity.from_identify_result(
+                        await _identify_speaker(body)
+                    )
             except HTTPException as exc:
                 turn = session.reject_turn(
                     turn_id,
                     f"声纹识别失败，本段未发送给助手：{exc.detail}",
                 )
             else:
-                try:
-                    turn = session.evaluate_turn(
-                        turn_id,
-                        identity,
-                        body,
-                        text=text,
-                        language=language,
-                        kws_detected=kws_detected,
-                        kws_keyword=kws_keyword,
-                    )
-                    turn = await session.decide_turn(turn)
-                except (KeyError, ValueError) as exc:
-                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if identity is None:
+                    turn = session.reject_turn(turn_id, "未识别为当前会话成员，等待唤醒词加入")
+                else:
+                    try:
+                        turn = session.evaluate_turn(
+                            turn_id,
+                            identity,
+                            body,
+                            text=text,
+                            language=language,
+                            kws_detected=kws_detected,
+                            kws_keyword=kws_keyword,
+                        )
+                        if identity.speaker_id in session.participant_ids:
+                            turn = await session.decide_turn(turn)
+                    except (KeyError, ValueError) as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     result = turn.public()
     result.update(
