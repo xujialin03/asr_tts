@@ -24,7 +24,7 @@
 - 前端：Vue 3、Vite、Web Audio API
 - 浏览器 VAD：Silero VAD（`@ricky0123/vad-web`）
 - 后端：FastAPI、uv、httpx
-- 语音识别：远程 Qwen3-ASR 流式识别服务
+- 语音识别：OpenAI 兼容 Qwen3-ASR 网关（整段转写）
 - 关键词唤醒：独立可选的 sherpa-onnx 中文 KWS 服务
 - 声纹识别：CAM++ 服务 + PostgreSQL
 - 交互决策：远程 OpenAI 兼容生成式决策模型（默认 `qwen3.6-35b-awq`，可换端点）
@@ -88,7 +88,7 @@ cp .env.example .env
 
 根目录 `config.yaml` 是后端的主要配置文件，包括：
 
-- `services.asr`：Qwen3-ASR 地址
+- `services.asr`：OpenAI 兼容 ASR 网关（`base_url` 带 `/v1` 前缀，含 `model`、`api_key`、`timeout_seconds`）
 - `services.tts`：Breeze-TTS-2 地址
 - `services.voiceprint`：本地声纹服务地址
 - `services.kws`：KWS 地址、启用状态与失败降级策略
@@ -194,8 +194,8 @@ npm run dev
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/health` | 后端状态与上游服务地址 |
-| `POST` | `/api/session/start` | 创建本地交互 session，远程 ASR 按需懒启动 |
-| `POST` | `/api/transcribe?session_id=<id>` | 转写 VAD 产生的完整语音片段 |
+| `POST` | `/api/session/start` | 创建本地交互 session |
+| `POST` | `/api/transcribe?session_id=<id>` | 转写 VAD 产生的完整语音片段（整段 WAV 一次性提交 OpenAI 兼容 ASR 网关） |
 | `POST` | `/api/kws/detect` | 调用可选的本地 KWS 服务 |
 | `GET` | `/api/session/{id}` | 查询激活状态与侦听到的声音 |
 | `POST` | `/api/session/{id}/turns` | 在 speech-start 创建不可变语音轮次 |
@@ -208,7 +208,7 @@ FastAPI 后端还提供声纹用户和模板管理代理接口，详细契约见
 
 ## 上游音频协议
 
-- ASR 输入：little-endian float32 PCM、16kHz、单声道；流式模式通常每 500ms 推送一个 chunk。
+- ASR 输入：浏览器 VAD 产出 little-endian float32 PCM、16kHz、单声道片段；后端将其转成 16-bit PCM WAV，通过 `POST {asr.base_url}/audio/transcriptions`（multipart，带 `model` 字段）一次性提交转写。
 - TTS 请求：Hermes 每轮返回 `text` 和动态 `instruction`；后端以 `multipart/form-data` 调用 `/v1/audio/speech`，并附带 `instruction`、配置的 `cfg_scale`、`ref_audio` 和 `ref_text`。Hermes 未返回有效 `instruction` 时回退到 `tts.prompt`。
 - TTS 响应：`audio/pcm` 裸 PCM、16-bit、单声道，采样率由上游 `/health` 返回（当前默认 24000Hz）；后端通过 `X-Sample-Rate` 响应头传给前端。
 - Breeze-TTS-2 上游只支持单并发，后端通过锁避免同时发起多个合成请求。
@@ -223,6 +223,12 @@ FastAPI 后端还提供声纹用户和模板管理代理接口，详细契约见
 - KWS 默认 `fail_open: true` 表示服务异常时降级为精确文本唤醒，而不是绕过唤醒门控。
 
 ## 更新记录
+
+### 2026-10-27 · ASR 整段转写化 + 接入 MCP 前快照
+
+- **ASR 改为 OpenAI 兼容网关整段转写**：移除自定义流式协议（`/api/start`、`/api/chunk`、`/api/finish` 端点与远程 ASR session）。VAD 产出的完整语音片段由后端转成 16-bit PCM WAV，一次性 POST 到 `{asr.base_url}/audio/transcriptions`。`config.yaml` 的 `services.asr` 相应改为 `base_url`（带 `/v1`）+ `model` + `api_key` + `timeout_seconds`。
+- **direct_llm 对话逻辑抽离为进程内 Agent**：原先内联在 `Session` 里的系统提示词、消息拼装、模型调用与技能执行下沉到 `backend/conversation_agent.py` 的 `VoiceConversationAgent`；`Session` 只负责构造 `AgentTurn` 并按返回的 `preferred_name` 更新声纹画像。
+- 此为接入设备 MCP（LeRobot SO101 遥操）之前的基线快照。
 
 ### 2026-10-20 · 决策模型化 + 去参与者
 

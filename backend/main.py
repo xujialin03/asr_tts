@@ -6,9 +6,8 @@ state; Hermes owns the assistant conversation history.
 
 Frontend flow:
   POST /api/session/start   -> create local interaction session -> {session_id}
-  POST /api/chunk           -> stream float32 PCM to ASR        -> {language, text}
-  POST /api/finish          -> finish ASR                       -> {language, text}
-  POST /api/chat            -> consume an admitted turn in Hermes -> {reply, tts_instruction}
+  POST /api/transcribe      -> transcribe a full VAD segment via ASR gateway -> {language, text}
+  POST /api/chat            -> consume an admitted turn -> {reply, tts_instruction}
   POST /api/tts             -> synthesize speech (streaming PCM)
 """
 
@@ -26,7 +25,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import config
-from session import ASR_CHUNK_BYTES, SpeakerIdentity, sessions
+from session import SpeakerIdentity, sessions
 
 # Long read timeout: a chunk call blocks until the remote returns a transcript.
 client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
@@ -92,7 +91,7 @@ async def session_start() -> JSONResponse:
     # lazily when audio is actually sent; otherwise VAD/chat-only usage leaks
     # idle remote ASR sessions and eventually makes the ASR service hang.
     s = sessions.create()
-    return JSONResponse({**s.snapshot(), "asr_session_id": None})
+    return JSONResponse(s.snapshot())
 
 
 @app.get("/api/session/{session_id}")
@@ -115,60 +114,28 @@ def _get_session(session_id: str):
 
 
 # ---- ASR relay ----
-@app.post("/api/chunk")
-async def chunk(request: Request, session_id: str) -> JSONResponse:
-    s = _get_session(session_id)
-    body = await request.body()
-    try:
-        j = await s.asr_chunk(client, body)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"ASR chunk failed: {e}")
-    return JSONResponse(j)
-
-
-@app.post("/api/finish")
-async def finish(session_id: str) -> JSONResponse:
-    s = _get_session(session_id)
-    try:
-        j = await s.asr_finish(client)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"ASR finish failed: {e}")
-    return JSONResponse(j)
-
-
 @app.post("/api/transcribe")
 async def transcribe(request: Request, session_id: str) -> JSONResponse:
-    """Transcribe a complete utterance (float32 PCM 16k mono) without finish().
+    """Transcribe a complete utterance (raw float32 PCM 16k mono).
 
-    Silero VAD gives us a full speech segment. The remote ASR's /api/finish is
-    currently prone to hanging, so this path sends the whole segment as chunks
-    and returns the latest cumulative chunk result.
+    Silero VAD gives us a full speech segment; the backend wraps it into a WAV
+    and calls the OpenAI-compatible ASR gateway in one shot.
     """
     s = _get_session(session_id)
     body = await request.body()
     if not body:
         return JSONResponse({"language": "", "text": ""})
     try:
-        await s.asr_start(client)
-        # Remote ASR expects fixed 500ms little-endian float32 chunks.
-        result = {"language": "", "text": ""}
-        for off in range(0, len(body), ASR_CHUNK_BYTES):
-            chunk = body[off : off + ASR_CHUNK_BYTES]
-            if chunk:
-                result = await s.asr_chunk(client, chunk)
-        # Abandon the remote session instead of calling finish(), which can hang.
-        s.asr_session_id = None
+        result = await s.transcribe(client, body)
         return JSONResponse(result)
     except httpx.HTTPStatusError as e:
-        s.asr_session_id = None
         detail = e.response.text[:500] if e.response is not None else str(e)
         raise HTTPException(
             status_code=502,
             detail=f"ASR transcribe failed: {e.response.status_code if e.response else ''} {detail}",
-        )
+        ) from e
     except httpx.HTTPError as e:
-        s.asr_session_id = None
-        raise HTTPException(status_code=502, detail=f"ASR transcribe failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=502, detail=f"ASR transcribe failed: {type(e).__name__}: {e}") from e
 
 
 async def _resolve_speaker(body: bytes) -> dict:

@@ -1,8 +1,12 @@
 # Copy to config.yaml at the repo root and fill in your service addresses.
 services:
   asr:
-    host: 127.0.0.1
-    port: 9020
+    # OpenAI-compatible ASR gateway. Provide either base_url (preferred, with
+    # the /v1 prefix) or host + port. api_key is sent as a Bearer token.
+    base_url: http://127.0.0.1:30080/v1
+    model: qwen3-asr
+    # api_key: ""
+    timeout_seconds: 60
   tts:
     name: breeze-tts-2
     host: 127.0.0.1

@@ -1,7 +1,49 @@
 import asyncio
+import array
+import wave
 
 from decision import InteractionDecision
-from session import HermesReply, Session, SpeakerIdentity, parse_hermes_reply
+from session import HermesReply, Session, SpeakerIdentity, _pcm_to_wav, parse_hermes_reply
+
+
+def _f32(frames):
+    arr = array.array("f", frames)
+    return arr.tobytes()
+
+
+def test_pcm_to_wav_roundtrips_length_and_format():
+    raw = _f32([0.0, 0.5, -0.5, 1.2, -1.5, 0.25])
+    out = _pcm_to_wav(raw)
+    # WAV header is 44 bytes; 6 samples at PCM16 = 12 bytes payload.
+    assert len(out) == 44 + 12
+    import io
+
+    with wave.open(io.BytesIO(out), "rb") as wav:
+        assert wav.getnchannels() == 1
+        assert wav.getsampwidth() == 2
+        assert wav.getframerate() == 16000
+        assert wav.getnframes() == 6
+        frames = wav.readframes(6)
+    values = array.array("h", frames).tolist()
+    # Clamped to int16 range, ~32767 scale.
+    assert values[0] == 0
+    assert values[1] == int(0.5 * 32767)
+    assert values[3] == 32767  # 1.2 clamped up to 1.0
+    assert values[4] == -32767  # -1.5 clamped down to -1.0
+
+
+def test_pcm_to_wav_drops_trailing_partial_sample():
+    raw = _f32([0.5, 0.5]) + b"\x01\x02"  # 2 full f32 + 2 stray bytes
+    out = _pcm_to_wav(raw)
+    import io
+
+    with wave.open(io.BytesIO(out), "rb") as wav:
+        assert wav.getnframes() == 2
+
+
+def test_pcm_to_wav_empty():
+    out = _pcm_to_wav(b"")
+    assert len(out) == 44  # header only, zero frames
 
 
 def identity(speaker_id: str) -> SpeakerIdentity:
@@ -433,7 +475,7 @@ def test_real_reply_is_added_to_context(monkeypatch):
     turn = evaluate(session, "a", "志玲你好", active=False)
 
     async def reply(_turn):
-        return '{"text":"你好。","instruction":"平静"}'
+        return HermesReply(text="你好。", instruction="平静")
 
     monkeypatch.setattr(session, "_chat_reply", reply)
     result = asyncio.run(session.chat(turn.id))

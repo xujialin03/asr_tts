@@ -30,7 +30,13 @@ def _url(svc: dict) -> str:
 
 
 services = _cfg.get("services", {})
-ASR_BASE_URL = _url(services["asr"])
+_asr_service = services["asr"]
+# The ASR gateway is OpenAI-compatible; base_url already includes the /v1 prefix
+# when provided, otherwise host:port is used. An api_key is sent as Bearer auth.
+ASR_BASE_URL = (_asr_service.get("base_url") or _url(_asr_service)).rstrip("/")
+ASR_API_KEY = _asr_service.get("api_key", "")
+ASR_MODEL = _asr_service.get("model", "qwen3-asr")
+ASR_TIMEOUT_SECONDS = float(_asr_service.get("timeout_seconds", 60.0))
 TTS_BASE_URL = _url(services["tts"])
 _voiceprint_service = services.get("voiceprint", {"host": "127.0.0.1", "port": 8002})
 VOICEPRINT_BASE_URL = _url(_voiceprint_service)

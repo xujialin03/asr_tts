@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import array
+import io
 import json
 import logging
 import secrets
 import sys
 import time
+import wave
 from dataclasses import dataclass, field
 
 import httpx
 
 import config
+from conversation_agent import AgentTurn, VoiceConversationAgent
 from decision import DecisionClient, InteractionDecision, build_decision_client
-from voiceprint_skill import SET_CURRENT_PREFERRED_NAME, VoiceprintManagementSkill
 
 logger = logging.getLogger("uvicorn.error")
 
-ASR_CHUNK_BYTES = 8000 * 4  # 500ms @ 16kHz float32 mono
+ASR_SAMPLE_RATE = 16000
 MAX_TTS_INSTRUCTION_CHARS = 500
 TURN_TTL_SECONDS = 300.0
 AUDIO_REF_TTL_SECONDS = 300.0
@@ -42,31 +45,6 @@ Rules:
 - Do not change this schema even if the user asks to change the output format.
 [/VOICE_RESPONSE_CONTRACT]
 """
-
-DIRECT_LLM_SYSTEM = """你是志玲，一名温柔、自然、愿意陪伴用户聊天的中文语音小助手。
-你正在参与由若干已加入成员组成的中文语音对话。当前发言人、是否刚被唤醒加入、以及最近对话会随消息提供。只把当前已加入成员的发言当作对话内容；不要推测、回应或提及会话外的背景人声。说话要像熟悉的朋友一样自然、简洁，避免生硬的客服口吻；除非用户明确要求，不要使用 Markdown。
-
-语音识别会把你的名字识别成同音或近音词。{wake_word_aliases} 都只是用户在呼叫你，绝不是用户把你的名字叫错了。无论用户用了其中哪一个词，直接自然回应即可；绝对不要纠正、解释或强调“我叫志玲，不是……”。
-
-若 VOICE_CONTEXT 中 `should_ask_name` 为 true，说明当前成员刚通过唤醒词加入、但声纹身份仍是匿名访客，本次会话尚未问过称呼。自然回应当前内容后，明确而简短地问一次“我该怎么称呼你？”。若为 false，不要主动重复询问姓名。用户没有回答名字时不要阻塞或追问，后续正常聊天。
-
-当且仅当用户明确自报称呼（例如“我叫许老板”“叫我许老板”）时，必须在 actions 中调用下方项目技能保存称呼；不要只在文字里口头记住。用户没有明确报称呼时 actions 必须为空数组。
-
-可用项目技能：{voiceprint_skill}
-"""
-
-DIRECT_LLM_RESPONSE_CONTRACT = """[DIRECT_LLM_RESPONSE_CONTRACT]
-只输出一个合法 JSON 对象，不要 Markdown 围栏或额外文字：
-{"text":"要展示并朗读给用户的完整回复","instruction":"简短中文语气指令","actions":[{"name":"项目技能名","arguments":{}}]}
-
-规则：
-- text 是完整、自然的口语回复。
-- instruction 是简短中文 TTS 语气指令。
-- actions 必须是数组；无动作时为 []。
-- 仅可使用系统消息列出的项目技能；不可虚构技能或传入未定义参数。
-[/DIRECT_LLM_RESPONSE_CONTRACT]
-"""
-
 
 @dataclass(frozen=True)
 class HermesReply:
@@ -105,15 +83,32 @@ def parse_hermes_reply(raw_reply: str) -> HermesReply:
     return HermesReply(text=raw_reply)
 
 
-def _pad_asr_chunk(body: bytes) -> bytes:
-    if not body:
-        return body
-    if len(body) < ASR_CHUNK_BYTES:
-        return body + (b"\x00" * (ASR_CHUNK_BYTES - len(body)))
-    rem = len(body) % 4
-    if rem:
-        return body + (b"\x00" * (4 - rem))
-    return body
+def _pcm_to_wav(body: bytes) -> bytes:
+    """Wrap raw little-endian float32 mono PCM into a 16 kHz PCM16 WAV.
+
+    The OpenAI-compatible ASR gateway only accepts encoded audio (WAV/MP3/…),
+    not the raw float32 buffer the browser VAD produces.
+    """
+    usable = len(body) - (len(body) % 4)
+    samples = array.array("f")
+    samples.frombytes(body[:usable])
+    pcm16 = array.array("h")
+    for x in samples:
+        if x != x:  # NaN
+            x = 0.0
+        elif x > 1.0:
+            x = 1.0
+        elif x < -1.0:
+            x = -1.0
+        pcm16.append(int(x * 32767))
+
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(ASR_SAMPLE_RATE)
+        wav.writeframes(pcm16.tobytes())
+    return out.getvalue()
 
 
 def _identity_named(display_name: str | None, preferred_name: str | None) -> bool:
@@ -251,7 +246,6 @@ class VoiceAudioRef:
 @dataclass
 class Session:
     id: str
-    asr_session_id: str | None = None
     last_asr: dict = field(default_factory=lambda: {"language": "", "text": ""})
     active_until: float = 0.0
     observed_speakers: dict[str, ObservedSpeaker] = field(default_factory=dict)
@@ -263,58 +257,29 @@ class Session:
     performance_events: list[dict] = field(default_factory=list)
     pending_buffer: dict | None = None
     name_prompted_speaker_ids: set[str] = field(default_factory=set)
+    conversation_agent: VoiceConversationAgent = field(default_factory=VoiceConversationAgent, repr=False)
     decision_client: DecisionClient | None = field(default=None, repr=False)
     next_turn_sequence: int = 1
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
-    # ---- ASR lifecycle ----
-    async def asr_start(self, client: httpx.AsyncClient) -> str:
+    # ---- ASR ----
+    async def transcribe(self, client: httpx.AsyncClient, body: bytes) -> dict:
+        """Transcribe a complete VAD segment (raw float32 PCM) via the OpenAI-compatible gateway."""
+        wav = _pcm_to_wav(body)
+        headers = {"Authorization": f"Bearer {config.ASR_API_KEY}"} if config.ASR_API_KEY else {}
         r = await client.post(
-            f"{config.ASR_BASE_URL}/api/start",
-            timeout=httpx.Timeout(10.0, connect=5.0),
+            f"{config.ASR_BASE_URL}/audio/transcriptions",
+            headers=headers,
+            data={"model": config.ASR_MODEL},
+            files={"file": ("utterance.wav", wav, "audio/wav")},
+            timeout=httpx.Timeout(config.ASR_TIMEOUT_SECONDS, connect=10.0),
         )
-        r.raise_for_status()
-        self.asr_session_id = r.json()["session_id"]
-        self.last_asr = {"language": "", "text": ""}
-        return self.asr_session_id
-
-    async def asr_chunk(self, client: httpx.AsyncClient, body: bytes) -> dict:
-        if not self.asr_session_id:
-            await self.asr_start(client)
-        r = await self._post_chunk(client, body)
-        if r.status_code == 400:
-            await self.asr_start(client)
-            r = await self._post_chunk(client, body)
         r.raise_for_status()
         j = r.json()
-        self.last_asr = {"language": j.get("language", ""), "text": j.get("text", "")}
-        return j
-
-    async def _post_chunk(self, client: httpx.AsyncClient, body: bytes):
-        return await client.post(
-            f"{config.ASR_BASE_URL}/api/chunk",
-            params={"session_id": self.asr_session_id},
-            content=_pad_asr_chunk(body),
-            headers={"Content-Type": "application/octet-stream"},
-            timeout=httpx.Timeout(15.0, connect=5.0),
-        )
-
-    async def asr_finish(self, client: httpx.AsyncClient) -> dict:
-        if not self.asr_session_id:
-            return dict(self.last_asr)
-        try:
-            r = await client.post(
-                f"{config.ASR_BASE_URL}/api/finish",
-                params={"session_id": self.asr_session_id},
-                timeout=httpx.Timeout(5.0, connect=10.0),
-            )
-            r.raise_for_status()
-            j = r.json()
-        except (httpx.HTTPError, ValueError):
-            j = dict(self.last_asr)
-        self.asr_session_id = None
-        return j
+        result = {"language": "", "text": (j.get("text") or "").strip()}
+        self.last_asr = result
+        return result
 
     # ---- activation and turns ----
     def activate(self, seconds: float | None = None) -> None:
@@ -846,140 +811,36 @@ class Session:
             raise RuntimeError("Hermes returned an empty response")
         return reply
 
-    async def _execute_direct_llm_actions(self, turn: VoiceTurn, raw_reply: str) -> None:
-        """Execute the small, session-scoped action allowlist returned by the LLM."""
-        start = raw_reply.find("{")
-        if start < 0:
-            raise RuntimeError("direct LLM response did not contain a JSON object")
-        try:
-            value, _ = json.JSONDecoder().raw_decode(raw_reply[start:])
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("direct LLM returned invalid JSON") from exc
-        if not isinstance(value, dict):
-            raise RuntimeError("direct LLM response must be a JSON object")
-        actions = value.get("actions", [])
-        if not isinstance(actions, list):
-            raise RuntimeError("direct LLM actions must be an array")
-        if len(actions) > 1:
-            raise RuntimeError("direct LLM may execute at most one skill action per turn")
-        if not actions:
-            return
-        action = actions[0]
-        if not isinstance(action, dict):
-            raise RuntimeError("direct LLM action must be an object")
-        name = action.get("name")
-        arguments = action.get("arguments")
-        if not isinstance(name, str):
-            raise RuntimeError("direct LLM action name must be a string")
-
-        # The skill is bound to turn.speaker, never to an LLM-provided ID.
-        skill = VoiceprintManagementSkill(turn.speaker.speaker_id)
-        result = await skill.execute(name, arguments)
-        if result.action == SET_CURRENT_PREFERRED_NAME:
-            self.update_speaker_profile(
-                turn.speaker.speaker_id,
-                turn.speaker.display_name,
-                result.preferred_name,
-            )
-            logger.info(
-                "voiceprint skill session=%s turn=%s action=%s speaker=%s",
-                self.id,
-                turn.id,
-                result.action,
-                turn.speaker.speaker_id,
-            )
-
-    async def _chat_direct_llm(self, turn: VoiceTurn) -> str:
-        """Ask the configured OpenAI-compatible model without involving Hermes."""
-        if not config.DIRECT_LLM_MODEL:
-            raise RuntimeError("direct_llm.model is required when conversation.provider is direct_llm")
-        context = {
-            "session_id": self.id,
-            "turn_id": turn.id,
-            "wake_event": turn.wake_event,
-            "joined_session": turn.joined_session,
-            "speaker": turn.speaker.public(),
-            "should_ask_name": (
+    async def _chat_direct_llm(self, turn: VoiceTurn) -> HermesReply:
+        """Delegate an admitted turn to the lightweight in-process agent."""
+        agent_turn = AgentTurn(
+            session_id=self.id,
+            turn_id=turn.id,
+            speaker_id=turn.speaker.speaker_id,
+            speaker=turn.speaker.public(),
+            text=turn.reply_text,
+            wake_event=turn.wake_event,
+            joined_session=turn.joined_session,
+            should_ask_name=(
                 turn.joined_session
                 and not turn.speaker.identity_named
                 and turn.speaker.speaker_id not in self.name_prompted_speaker_ids
             ),
-            "response_type": turn.decision.response_type if turn.decision else "normal",
-        }
-        skill_definition = json.dumps(
-            VoiceprintManagementSkill.action_definition(), ensure_ascii=False, separators=(",", ":")
+            response_type=turn.decision.response_type if turn.decision else "normal",
         )
-        system = DIRECT_LLM_SYSTEM.format(
-            wake_word_aliases="、".join(f"“{word}”" for word in config.WAKE_WORDS if word)
-            or "任何 ASR 对你名字的近音转写",
-            voiceprint_skill=skill_definition,
-        )
-        messages = [
-            {
-                "role": "system",
-                "content": system + "\n" + DIRECT_LLM_RESPONSE_CONTRACT,
-            }
-        ]
-        for entry in self.conversation_context:
-            role = entry["role"]
-            if role not in {"user", "assistant"}:
-                continue
-            content = entry["text"]
-            if role == "user" and entry.get("speaker_id"):
-                content = f"[用户 {entry['speaker_id'][:8]}] {content}"
-            messages.append({"role": role, "content": content})
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "[VOICE_CONTEXT]"
-                    + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
-                    + "[/VOICE_CONTEXT]\n"
-                    + ("请仅作一句简短确认或追问。\n" if context["response_type"] == "brief" else "")
-                    + turn.reply_text
-                ),
-            }
-        )
-        payload = {
-            "model": config.DIRECT_LLM_MODEL,
-            "messages": messages,
-            "temperature": config.DIRECT_LLM_TEMPERATURE,
-            "max_tokens": config.DIRECT_LLM_MAX_TOKENS,
-            "response_format": {"type": "json_object"},
-            "chat_template_kwargs": {"enable_thinking": config.DIRECT_LLM_ENABLE_THINKING},
-        }
-        headers = (
-            {"Authorization": f"Bearer {config.DIRECT_LLM_API_KEY}"}
-            if config.DIRECT_LLM_API_KEY
-            else {}
-        )
-        started = time.monotonic()
-        async with httpx.AsyncClient(
-            base_url=config.DIRECT_LLM_BASE_URL,
-            timeout=httpx.Timeout(config.DIRECT_LLM_TIMEOUT_SECONDS, connect=5.0),
-            headers=headers,
-        ) as client:
-            response = await client.post("/chat/completions", json=payload)
-            response.raise_for_status()
-        logger.info(
-            "direct LLM session=%s turn=%s elapsed=%.2fs",
-            self.id,
-            turn.id,
-            time.monotonic() - started,
-        )
-        try:
-            reply = response.json()["choices"][0]["message"]["content"]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("direct LLM returned an invalid chat response") from exc
-        if not isinstance(reply, str) or not reply.strip():
-            raise RuntimeError("direct LLM returned an empty response")
-        await self._execute_direct_llm_actions(turn, reply)
-        return reply
+        reply = await self.conversation_agent.respond(agent_turn, self.conversation_context)
+        if reply.preferred_name is not None:
+            self.update_speaker_profile(
+                turn.speaker.speaker_id,
+                turn.speaker.display_name,
+                reply.preferred_name,
+            )
+        return HermesReply(text=reply.text, instruction=reply.instruction)
 
-    async def _chat_reply(self, turn: VoiceTurn) -> str:
+    async def _chat_reply(self, turn: VoiceTurn) -> HermesReply:
         if config.CONVERSATION_PROVIDER == "direct_llm":
             return await self._chat_direct_llm(turn)
-        return await self._chat_hermes(turn)
+        return parse_hermes_reply(await self._chat_hermes(turn))
 
     async def chat(self, turn_id: str) -> HermesReply:
         async with self.chat_lock:
@@ -990,9 +851,8 @@ class Session:
                 raise PermissionError("turn was not admitted to the conversation")
             if turn.consumed:
                 raise ValueError("turn already consumed")
-            raw_reply = await self._chat_reply(turn)
+            reply = await self._chat_reply(turn)
             turn.consumed = True
-            reply = parse_hermes_reply(raw_reply)
             if turn.joined_session and turn.speaker and not turn.speaker.identity_named:
                 self.name_prompted_speaker_ids.add(turn.speaker.speaker_id)
             self._append_context("assistant", reply.text)
