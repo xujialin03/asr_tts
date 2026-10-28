@@ -63,7 +63,21 @@
       "Bash(sed -n '183,187p' frontend/src/ttsPlayer.js)",
       "Bash(sed -n '29,33p;74,91p' config.yaml)",
       "Bash(sed -n '36,40p;102,122p' config.yaml.example)",
-      "Bash(awk -F: '$1 < 55 || $1 > 83')"
+      "Bash(awk -F: '$1 < 55 || $1 > 83')",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(file backend/assets/*.wav)",
+      "Bash(python3 -)",
+      "Bash(pkill -f \"uvicorn main:app.*8010\")",
+      "Bash(curl -s -m 2 http://127.0.0.1:8010/health)",
+      "Bash(rm -f /tmp/test_16k.wav /tmp/test_16k_f32.raw)",
+      "Bash(python3 -c \"print\\('duration:', 468480/2/24000, 's'\\)\")",
+      "Bash(pkill -f \"uvicorn main:app.*8012\")",
+      "Bash(curl -s -m 2 http://127.0.0.1:8012/health)",
+      "Bash(rm -f /tmp/test_16k_f32.raw /tmp/test_out.pcm /tmp/asr_backend2.log /tmp/asr_backend.log)",
+      "Bash(npm run *)",
+      "Bash(xargs -r ps -o pid,comm)",
+      "Bash(curl -sS -m 5 -o /dev/null -w \"vite HTTP %{http_code}\\\\n\" http://localhost:5173/)"
     ]
   }
 }

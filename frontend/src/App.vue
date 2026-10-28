@@ -260,10 +260,47 @@ const MAX_VAD_QUEUE = 4;
 // the conversation has moved on, so replaying old fragments yields confusing
 // replies. A queued segment older than this is treated as stale backlog.
 const VAD_QUEUE_STALE_MS = 6000;
-// Chat replies run off the VAD pipeline: chained so they stay ordered and
-// one-at-a-time, but never awaited by the drain loop. A slow or hung chat call
-// must not stop the mic from transcribing/evaluating the next utterance.
-let replyChain = Promise.resolve();
+// Chat replies run off the VAD pipeline: a slow or hung LLM call must not stop
+// the mic from transcribing/evaluating the next utterance. Replies are queued
+// and drained one-at-a-time; when the queue backs up we keep only the freshest
+// turns, because answering stale speech produces confusing replies.
+const MAX_REPLY_QUEUE = 2;
+const REPLY_QUEUE_STALE_MS = 4000;
+const replyQueue = [];
+let replyQueueRunning = false;
+
+function queueReply(turnId, speaker) {
+  replyQueue.push({ turnId, speaker, queuedAt: Date.now() });
+  if (replyQueue.length > MAX_REPLY_QUEUE) {
+    const dropped = replyQueue.length - MAX_REPLY_QUEUE;
+    replyQueue.splice(0, dropped);
+    gateNotice.value = `回复积压，已跳过较早的 ${dropped} 条`;
+  }
+  drainReplyQueue();
+}
+
+async function drainReplyQueue() {
+  if (replyQueueRunning) return;
+  replyQueueRunning = true;
+  try {
+    while (replyQueue.length) {
+      if (
+        replyQueue.length > 1 &&
+        Date.now() - replyQueue[0].queuedAt > REPLY_QUEUE_STALE_MS
+      ) {
+        const newest = replyQueue[replyQueue.length - 1];
+        const dropped = replyQueue.length - 1;
+        replyQueue.length = 0;
+        replyQueue.push(newest);
+        gateNotice.value = `回复积压后恢复，已跳过 ${dropped} 条过时回复，仅回应最新一条`;
+      }
+      const item = replyQueue.shift();
+      await sendToLLM(item.turnId, item.speaker);
+    }
+  } finally {
+    replyQueueRunning = false;
+  }
+}
 
 async function handleEvaluatedTurn(decision, recognizedText) {
   applySessionState(decision.session);
@@ -309,10 +346,10 @@ async function handleEvaluatedTurn(decision, recognizedText) {
 
   const replyText = (decision.reply_text || recognizedText).trim();
   appendUserMessage(replyText, identity);
-  // Chain the chat reply off the VAD pipeline. The drain loop returns as soon
+  // Queue the chat reply off the VAD pipeline. The drain loop returns as soon
   // as the turn is evaluated, so the mic keeps listening even if this reply is
-  // slow or hangs. Chaining keeps replies ordered and one-at-a-time.
-  replyChain = replyChain.then(() => sendToLLM(decision.turn_id, identity));
+  // slow or hangs. A backed-up queue keeps only the freshest turns.
+  queueReply(decision.turn_id, identity);
 }
 
 function queueVadAudio(item) {
@@ -472,6 +509,7 @@ function clearVoiceEvents() {
 
 async function clearAll() {
   stopSpeak();
+  replyQueue.length = 0;
   if (sessionId) {
     try {
       await endSession(sessionId);

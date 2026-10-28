@@ -31,6 +31,11 @@ const SOFT_BREAKS = ["。", "！", "？", "；", "!", "?", ";", "\n"];
 // in the timing log / perf records rather than hiding inside "synthesizing".
 const SLOW_SEGMENT_MS = 1500;
 
+// The backend holds a global TTS_LOCK (upstream is single-concurrency), so a
+// request can get 409 if another tab or a race grabs it. One short retry usually
+// clears it; a genuine persistent 409 still surfaces as an error.
+const TTS_BUSY_RETRY_DELAY_MS = 400;
+
 function audioCtx() {
   if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
   return ctx;
@@ -101,12 +106,26 @@ async function streamSegment(handle, text, segmentIndex, { instruction, onDurati
   const startedAt = performance.now();
 
   handle.abort = new AbortController();
-  const res = await fetch("/api/tts", {
+  let res = await fetch("/api/tts", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, instruction }),
     signal: handle.abort.signal,
   });
+  if (res.status === 409 && !handle.cancelled) {
+    // Upstream TTS is busy (backend lock held elsewhere). Back off once.
+    console.info(`[Voice timing] TTS seg#${segmentIndex} busy (409), retrying in ${TTS_BUSY_RETRY_DELAY_MS}ms`);
+    onTiming?.("tts_busy_retry", TTS_BUSY_RETRY_DELAY_MS, { segmentIndex });
+    await new Promise((resolve) => setTimeout(resolve, TTS_BUSY_RETRY_DELAY_MS));
+    if (!handle.cancelled) {
+      res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, instruction }),
+        signal: handle.abort.signal,
+      });
+    }
+  }
   if (!res.ok) throw new Error(`tts failed: ${res.status} ${await res.text()}`);
 
   const requestId = res.headers.get("X-TTS-Request-ID") || "?";
