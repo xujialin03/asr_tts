@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe CLI used by the Hermes voiceprint-management skill."""
+"""Safe CLI used by the voiceprint-management skill."""
 
 from __future__ import annotations
 

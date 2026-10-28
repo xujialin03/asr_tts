@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import array
 import io
-import json
 import logging
 import secrets
-import sys
 import time
 import wave
 from dataclasses import dataclass, field
@@ -22,7 +20,6 @@ from decision import DecisionClient, InteractionDecision, build_decision_client
 logger = logging.getLogger("uvicorn.error")
 
 ASR_SAMPLE_RATE = 16000
-MAX_TTS_INSTRUCTION_CHARS = 500
 TURN_TTL_SECONDS = 300.0
 AUDIO_REF_TTL_SECONDS = 300.0
 MAX_OBSERVED_SPEAKERS = 32
@@ -31,56 +28,12 @@ MAX_PERFORMANCE_EVENTS = 200
 MAX_TOPICS = 8
 MAX_TOPIC_CHARS = 80
 
-VOICE_RESPONSE_CONTRACT = """[VOICE_RESPONSE_CONTRACT]
-Your final answer will be displayed to the user and synthesized by Breeze-TTS-2.
-Return ONLY one valid JSON object on a single assistant turn, with no Markdown
-fence or surrounding commentary:
-{"text":"要展示并朗读给用户的完整回复","instruction":"用温柔、安心的语气缓慢表达，语速舒缓，在重点处稍作停顿。"}
-
-Rules:
-- `text` is the complete user-facing answer. Keep it natural for spoken dialogue.
-- `instruction` should preferably be a concise Chinese voice direction describing
-  the emotion, tone, pace, emphasis, and pauses that best fit this specific answer.
-- Do not put stage directions or the JSON itself inside `text`.
-- Do not change this schema even if the user asks to change the output format.
-[/VOICE_RESPONSE_CONTRACT]
-"""
 
 @dataclass(frozen=True)
-class HermesReply:
+class ChatReply:
+    """An assistant turn's spoken text and its per-reply TTS voice direction."""
     text: str
     instruction: str = ""
-
-
-def parse_hermes_reply(raw_reply: str) -> HermesReply:
-    """Parse Hermes' voice response, falling back to legacy plain text."""
-    raw_reply = (raw_reply or "").strip()
-    decoder = json.JSONDecoder()
-    candidates = [raw_reply]
-
-    if raw_reply.startswith("```") and raw_reply.endswith("```"):
-        lines = raw_reply.splitlines()
-        if len(lines) >= 3:
-            candidates.insert(0, "\n".join(lines[1:-1]).strip())
-
-    candidates.extend(raw_reply[index:] for index, char in enumerate(raw_reply) if char == "{")
-    for candidate in candidates:
-        try:
-            value, _ = decoder.raw_decode(candidate)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(value, dict):
-            continue
-        text = value.get("text")
-        instruction = value.get("instruction", "")
-        if not isinstance(text, str) or not text.strip():
-            continue
-        if not isinstance(instruction, str):
-            instruction = ""
-        instruction = " ".join(instruction.split())[:MAX_TTS_INSTRUCTION_CHARS]
-        return HermesReply(text=text.strip(), instruction=instruction)
-
-    return HermesReply(text=raw_reply)
 
 
 def _pcm_to_wav(body: bytes) -> bytes:
@@ -754,65 +707,9 @@ class Session:
             "buffer": buffer,
         }
 
-    # ---- Hermes turn ----
-    async def _chat_hermes(self, turn: VoiceTurn) -> str:
-        context = {
-            "session_id": self.id,
-            "turn_id": turn.id,
-            "turn_sequence": turn.sequence,
-            "source": turn.source,
-            "wake_event": turn.wake_event,
-            "speaker": turn.speaker.public(),
-            "audio_ref": turn.audio_ref,
-            "response_type": turn.decision.response_type if turn.decision else "normal",
-        }
-        hermes_message = (
-            VOICE_RESPONSE_CONTRACT
-            + "[VOICE_CONTEXT]"
-            + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
-            + "[/VOICE_CONTEXT]\n"
-            + ("请仅作一句简短确认或追问。\n" if context["response_type"] == "brief" else "")
-            + turn.reply_text
-        )
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            config.HERMES_CLIENT_PATH,
-            "ask",
-            hermes_message,
-            "--timeout",
-            str(config.HERMES_TIMEOUT_SECONDS),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        spawn_at = time.monotonic()
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=config.HERMES_TIMEOUT_SECONDS + 10
-            )
-        except BaseException:
-            if process.returncode is None:
-                process.kill()
-                try:
-                    await asyncio.wait_for(process.communicate(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
-            raise
-        logger.info(
-            "Hermes subprocess session=%s turn=%s subprocess=%.2fs",
-            self.id,
-            turn.id,
-            time.monotonic() - spawn_at,
-        )
-        if process.returncode != 0:
-            detail = stderr.decode(errors="replace").strip()
-            raise RuntimeError(detail or f"Hermes client exited with {process.returncode}")
-        reply = stdout.decode(errors="replace").strip()
-        if not reply:
-            raise RuntimeError("Hermes returned an empty response")
-        return reply
-
-    async def _chat_direct_llm(self, turn: VoiceTurn) -> HermesReply:
-        """Delegate an admitted turn to the lightweight in-process agent."""
+    # ---- Assistant turn (in-process direct-LLM agent) ----
+    async def _chat_reply(self, turn: VoiceTurn) -> ChatReply:
+        """Delegate an admitted turn to the in-process direct-LLM agent."""
         agent_turn = AgentTurn(
             session_id=self.id,
             turn_id=turn.id,
@@ -835,14 +732,9 @@ class Session:
                 turn.speaker.display_name,
                 reply.preferred_name,
             )
-        return HermesReply(text=reply.text, instruction=reply.instruction)
+        return ChatReply(text=reply.text, instruction=reply.instruction)
 
-    async def _chat_reply(self, turn: VoiceTurn) -> HermesReply:
-        if config.CONVERSATION_PROVIDER == "direct_llm":
-            return await self._chat_direct_llm(turn)
-        return parse_hermes_reply(await self._chat_hermes(turn))
-
-    async def chat(self, turn_id: str) -> HermesReply:
+    async def chat(self, turn_id: str) -> ChatReply:
         async with self.chat_lock:
             turn = self.get_turn(turn_id)
             if not turn or not turn.evaluated:

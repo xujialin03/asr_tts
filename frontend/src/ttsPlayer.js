@@ -182,7 +182,7 @@ async function streamSegment(handle, text, segmentIndex, { instruction, onDurati
 
 /**
  * Synthesize + stream-play `text`, split into short segments requested serially.
- * `instruction` is the per-reply voice direction produced by Hermes.
+ * `instruction` is the per-reply voice direction produced by the assistant agent.
  * @returns {Promise<void>} resolves when playback finishes (or is cancelled).
  */
 export async function playTts(text, { instruction = "", onState, onDuration, onTiming } = {}) {

@@ -72,7 +72,7 @@ services:
     enabled: false
 ```
 
-关闭后后端 `/api/kws/detect` 返回 `available: false`，门控继续使用原有精确文本唤醒词。也可以删除 `compose.yaml` 的 `kws` service 与 `kws-service/`；ASR、声纹和 Hermes 不需要修改。
+关闭后后端 `/api/kws/detect` 返回 `available: false`，门控继续使用原有精确文本唤醒词。也可以删除 `compose.yaml` 的 `kws` service 与 `kws-service/`；ASR、声纹和对话 Agent 不需要修改。
 
 KWS 服务运行失败时，默认 `fail_open: true`，自动降级到精确文本规则，不阻断语音对话。
 

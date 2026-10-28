@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 import config
+from teleop_skill import TeleopMCPSkill
 from voiceprint_skill import SET_CURRENT_PREFERRED_NAME, VoiceprintManagementSkill
 
 logger = logging.getLogger("uvicorn.error")
@@ -31,8 +32,83 @@ SYSTEM_PROMPT = """你是志玲，一名温柔、自然、愿意陪伴用户聊�
 
 当且仅当用户明确自报称呼（例如“我叫许老板”“叫我许老板”）时，必须在 actions 中调用下方项目技能保存称呼；不要只在文字里口头记住。用户没有明确报称呼时 actions 必须为空数组。
 
-可用项目技能：{voiceprint_skill}
+可用项目技能：{skills}
+{teleop_rules}
 """
+
+TELEOP_RULES = """遥操/推理/视觉技能（teleop.*）操作一台真实的 SO101 机械臂及双摄，务必谨慎：
+- 仅当用户明确要求启动/停止/查询某项操作时才调用；闲聊不要调用。
+- start_teleoperation 与 start_inference 都会使实体机械臂通电运动；调用前必须确认用户已确认现场有人看护、机械臂周围无人无遮挡；否则先用一句话向用户确认，本轮不要调用。
+- 用户说“停止/停下/快停”或提到碰撞、抖动、失控、画面冻结时：遥操中调用 stop_teleoperation，推理中调用 stop_inference。
+- start_inference 只需把用户的自然语言任务作为 instruction 传入；不要替用户编造模型或 Corrector，服务端会自动选择。当前仅部署了“紫鸭入盒”一类已注册权重，匹配不到会报错，据实转述即可。
+- ask_camera_vision 不移动机械臂，但会把当前双摄截图发到外部视觉模型；用户问“你看到了什么/画面里有什么”一类问题时调用。
+- 查询与卸载类（get_*_status / get_joint_curves / unload_inference_model）安全，可直接调用。
+- 视频流和看板 URL 很长且带鉴权，不要口头念出；只告诉用户“可以在综合看板查看”。
+- 本轮最多执行一个技能动作；需要更多操作时先说明，下一轮再执行。"""
+
+TOOL_RESULT_CONTRACT = """[TOOL_RESULT]
+{name}
+{payload}
+[/TOOL_RESULT]
+上一步技能已经真实执行。请用一两句口语、自然地转述上面的关键结果给用户（例如当前是否在运行、参数、数值概况），只输出 JSON 对象 {{"text":"...","instruction":"..."}}，不要 actions，不要念 URL。"""
+
+
+def _redact_tokens(value: object) -> object:
+    """Strip auth tokens from any URL-looking strings before narration."""
+    if isinstance(value, str):
+        import re
+
+        cleaned = re.sub(r"[?&]token=[^&#\s\"']*", "", value)
+        # Collapse separators left by the removed token param: ?& -> ?, && -> &,
+        # a leading & (when ? was removed) -> ?, and trailing ?/&.
+        cleaned = re.sub(r"\?&", "?", cleaned)
+        cleaned = re.sub(r"&&", "&", cleaned)
+        cleaned = re.sub(r"(?<!\?)&(?=[^?]*$)", "?", cleaned)
+        cleaned = re.sub(r"[?&]$", "", cleaned)
+        return cleaned
+    if isinstance(value, dict):
+        return {key: _redact_tokens(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_tokens(item) for item in value]
+    return value
+
+
+def _narration_payload(action: str, structured: object) -> str:
+    """Compact the tool result for the narration pass (cap size, drop noise)."""
+    if not isinstance(structured, dict):
+        return json.dumps(_redact_tokens(structured), ensure_ascii=False)[:2000]
+    payload: dict[str, object] = {}
+    if action == "teleop.get_joint_curves":
+        payload["seconds"] = structured.get("seconds")
+        for side in ("leader", "follower"):
+            series = structured.get(side)
+            if isinstance(series, dict):
+                payload[side] = {
+                    axis: (values[-1] if isinstance(values, list) and values else None)
+                    for axis, values in series.items()
+                }
+    if action == "teleop.get_inference_status":
+        status = structured.get("status") or {}
+        payload["status"] = {
+            key: status.get(key)
+            for key in ("phase", "running", "resident", "model_warm", "total_dispatches", "error")
+        }
+        return json.dumps(_redact_tokens(payload), ensure_ascii=False)[:2000]
+    if action == "teleop.ask_camera_vision":
+        # Pass the answer through; cap size and strip any incidental token URLs.
+        payload["vision_status"] = structured.get("vision_status")
+        payload["answer"] = structured.get("answer")
+        payload["capture_source"] = structured.get("capture_source")
+        return json.dumps(_redact_tokens(payload), ensure_ascii=False)[:2000]
+    status = structured.get("status")
+    if isinstance(status, dict):
+        payload["status"] = {
+            key: status.get(key)
+            for key in ("mode", "phase", "running", "pid", "episode", "error", "teleop_config")
+        }
+    if action == "teleop.get_teleoperation_status":
+        payload["has_dashboard"] = bool(structured.get("dashboard_url"))
+    return json.dumps(_redact_tokens(payload), ensure_ascii=False)[:2000]
 
 RESPONSE_CONTRACT = """[DIRECT_LLM_RESPONSE_CONTRACT]
 只输出一个合法 JSON 对象，不要 Markdown 围栏或额外文字：
@@ -72,14 +148,15 @@ class VoiceConversationAgent:
 
     def _system_message(self) -> str:
         aliases = "、".join(f"“{word}”" for word in config.WAKE_WORDS if word)
-        skill = json.dumps(
-            VoiceprintManagementSkill.action_definition(),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        skills = [VoiceprintManagementSkill.action_definition()]
+        teleop_rules = ""
+        if config.TELEOP_ENABLED:
+            skills.extend(TeleopMCPSkill.definitions())
+            teleop_rules = "\n" + TELEOP_RULES
         return SYSTEM_PROMPT.format(
             wake_word_aliases=aliases or "任何 ASR 对你名字的近音转写",
-            voiceprint_skill=skill,
+            skills=json.dumps(skills, ensure_ascii=False, separators=(",", ":"), indent=1),
+            teleop_rules=teleop_rules,
         ) + "\n" + RESPONSE_CONTRACT
 
     def _messages(self, turn: AgentTurn, context: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -143,35 +220,54 @@ class VoiceConversationAgent:
             raise RuntimeError("direct LLM action must be an object")
         return text.strip(), " ".join(instruction.split())[:MAX_TTS_INSTRUCTION_CHARS], actions
 
-    async def _execute_actions(self, turn: AgentTurn, actions: list[dict[str, Any]]) -> str | None:
+    async def _execute_actions(
+        self, turn: AgentTurn, actions: list[dict[str, Any]]
+    ) -> tuple[str | None, str, dict[str, Any] | None]:
+        """Execute the single action. Returns (preferred_name, narration_text, narration_meta).
+
+        Voiceprint is a silent side effect (the model's own text covers it).
+        Teleop actions return data the user must hear, so narration_text is the
+        skill's fallback summary; respond() upgrades it via a second model pass.
+        """
         if not actions:
-            return None
+            return None, "", None
         action = actions[0]
         name = action.get("name")
         if not isinstance(name, str):
             raise RuntimeError("direct LLM action name must be a string")
-        # The model cannot choose a target speaker: the skill binds to turn.speaker_id.
-        result = await VoiceprintManagementSkill(turn.speaker_id).execute(
-            name,
-            action.get("arguments"),
-        )
-        if result.action == SET_CURRENT_PREFERRED_NAME:
-            return result.preferred_name
-        raise RuntimeError(f"unhandled voiceprint skill action: {result.action}")
+        if name == SET_CURRENT_PREFERRED_NAME:
+            # The model cannot choose a target speaker: the skill binds to turn.speaker_id.
+            result = await VoiceprintManagementSkill(turn.speaker_id).execute(
+                name,
+                action.get("arguments"),
+            )
+            if result.action == SET_CURRENT_PREFERRED_NAME:
+                return result.preferred_name, "", None
+            raise RuntimeError(f"unhandled voiceprint skill action: {result.action}")
+        if config.TELEOP_ENABLED and TeleopMCPSkill.is_supported(name):
+            try:
+                result = await TeleopMCPSkill().execute(name, action.get("arguments"))
+            except Exception as exc:  # network/contract failure: tell the user, don't crash the turn
+                logger.warning("teleop skill %s failed: %s", name, exc)
+                return None, "抱歉，我这边连不上遥操服务，稍后再试。", None
+            meta = {
+                "action": result.action,
+                "ok": result.ok,
+                "payload": _narration_payload(result.action, result.structured),
+            }
+            return None, result.fallback_summary, meta
+        raise RuntimeError(f"unknown skill action: {name}")
 
-    async def respond(self, turn: AgentTurn, context: list[dict[str, Any]]) -> AgentReply:
-        if not config.DIRECT_LLM_MODEL:
-            raise RuntimeError("direct_llm.model is required when conversation.provider is direct_llm")
+    async def _chat(self, messages: list[dict[str, str]]) -> str:
         payload = {
             "model": config.DIRECT_LLM_MODEL,
-            "messages": self._messages(turn, context),
+            "messages": messages,
             "temperature": config.DIRECT_LLM_TEMPERATURE,
             "max_tokens": config.DIRECT_LLM_MAX_TOKENS,
             "response_format": {"type": "json_object"},
             "chat_template_kwargs": {"enable_thinking": config.DIRECT_LLM_ENABLE_THINKING},
         }
         headers = {"Authorization": f"Bearer {config.DIRECT_LLM_API_KEY}"} if config.DIRECT_LLM_API_KEY else {}
-        started = time.monotonic()
         async with httpx.AsyncClient(
             base_url=config.DIRECT_LLM_BASE_URL,
             timeout=httpx.Timeout(config.DIRECT_LLM_TIMEOUT_SECONDS, connect=5.0),
@@ -185,8 +281,45 @@ class VoiceConversationAgent:
             raise RuntimeError("direct LLM returned an invalid chat response") from exc
         if not isinstance(raw_reply, str):
             raise RuntimeError("direct LLM returned an empty response")
-        text, instruction, actions = self._parse_reply(raw_reply)
-        preferred_name = await self._execute_actions(turn, actions)
+        return raw_reply
+
+    async def _narrate_tool_result(
+        self, turn: AgentTurn, messages: list[dict[str, Any]], meta: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        """Second model pass: turn the executed tool's data into a spoken update."""
+        narration_messages = messages + [
+            {
+                "role": "user",
+                "content": TOOL_RESULT_CONTRACT.format(name=meta["action"], payload=meta["payload"]),
+            }
+        ]
+        try:
+            raw = await self._chat(narration_messages)
+            text, instruction, actions = self._parse_reply(raw)
+        except Exception as exc:
+            logger.warning("teleop narration pass failed: %s", exc)
+            return None
+        if actions:
+            logger.warning("teleop narration pass returned actions; ignoring")
+        return text, instruction
+
+    async def respond(self, turn: AgentTurn, context: list[dict[str, Any]]) -> AgentReply:
+        if not config.DIRECT_LLM_MODEL:
+            raise RuntimeError("direct_llm.model is required")
+        started = time.monotonic()
+        messages = self._messages(turn, context)
+        text, instruction, actions = self._parse_reply(await self._chat(messages))
+        preferred_name, tool_text, tool_meta = await self._execute_actions(turn, actions)
+        if tool_text:
+            # Teleop result: prefer a model-narrated update over the raw summary.
+            if tool_meta and tool_meta["ok"]:
+                narrated = await self._narrate_tool_result(turn, messages, tool_meta)
+                if narrated:
+                    text, instruction = narrated
+                else:
+                    text = tool_text
+            else:
+                text = tool_text
         logger.info(
             "conversation agent session=%s turn=%s elapsed=%.2fs action=%s",
             turn.session_id,

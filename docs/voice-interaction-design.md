@@ -1,6 +1,6 @@
 # 语音交互详细设计
 
-本文记录语音助手的交互架构、状态机和关键实现约束。README 只保留项目介绍与运行方法；涉及 VAD、ASR、会话激活、打断、Hermes agent、TTS 的设计决策统一维护在本文。
+本文记录语音助手的交互架构、状态机和关键实现约束。README 只保留项目介绍与运行方法；涉及 VAD、ASR、会话激活、打断、direct-LLM 对话 Agent、TTS 的设计决策统一维护在本文。
 
 ## 1. 总体链路
 
@@ -12,15 +12,15 @@ Silero VAD（唯一语音输入模式，可通过界面开关启停）
 Qwen3-ASR
   ↓
 决策模型（上下文 / 说话人 / 唤醒信号）
-  ├─ silent：仅显示识别文本，不调用 Hermes
-  └─ normal / brief：项目专用 Hermes agent
+  ├─ silent：仅显示识别文本，不调用对话 Agent
+  └─ normal / brief：进程内 direct-LLM 对话 Agent
                          ↓
                       Breeze-TTS-2
                          ↓
                       Web Audio 流式播放
 ```
 
-前端负责麦克风、VAD、播放和用户交互；FastAPI 后端负责本地 Session、决策状态和远程服务代理。每个 Session 独立维护最近五条真实用户/助理消息，决策模型仅读取该上下文并输出结构化交互决策；Hermes 仍独占管理助理人设、长对话历史与任务执行。Hermes 的最终响应使用 `{"text":"...","instruction":"..."}`：`text` 用于页面展示和朗读，`instruction` 作为本轮动态 Voice Direction 传给 TTS；解析失败时兼容旧的纯文本回复。
+前端负责麦克风、VAD、播放和用户交互；FastAPI 后端负责本地 Session、决策状态、对话 Agent 和远程服务代理。每个 Session 独立维护最近五条真实用户/助理消息，决策模型仅读取该上下文并输出结构化交互决策；进程内 direct-LLM Agent 管理助理人设、对话上下文与技能调用（如 teleop.*）。Agent 的最终响应使用 `{"text":"...","instruction":"..."}`：`text` 用于页面展示和朗读，`instruction` 作为本轮动态 Voice Direction 传给 TTS；缺失时回退到 `tts.prompt`。
 
 ## 2. Silero VAD 输入模式
 
@@ -57,7 +57,7 @@ VAD 在 `onSpeechEnd(audio)` 产生完整 16kHz float32 PCM 片段，前端将�
 ```text
 普通环境语音 / 未加入者发言
   → 调用只读 identify（不自动建档）
-  → 未识别或不在当前参与者集合 → 静默忽略，不进入决策模型/Hermes/LLM
+  → 未识别或不在当前参与者集合 → 静默忽略，不进入决策模型/对话 Agent
 
 任何人说出唤醒词
   → resolve 声纹（已有身份复用；未知身份才建匿名档案）
@@ -85,17 +85,17 @@ VAD 在 `onSpeechEnd(audio)` 产生完整 16kHz float32 PCM 片段，前端将�
 
 免手持模式识别到环境人声后，文本先完成声纹与参与资格校验，再由决策模型结合完整交互上下文决定是否面向 AI 及是否回应。VAD→ASR 后送入决策模型的决策状态按架构图的数据模型组装：
 
-- `agent`：角色模型（AgentProfile），来自 `config.yaml` 的 `agent` 段（`name` / `role` / `persona`），让决策模型知道“助手是谁”。Hermes 在自己的 profile 里另有一份人设，这里只用于交互判断。
+- `agent`：角色模型（AgentProfile），来自 `config.yaml` 的 `agent` 段（`name` / `role` / `persona`），让决策模型知道“助手是谁”。进程内 direct-LLM Agent 在 `conversation_agent.SYSTEM_PROMPT` 里另有一份人设，这里只用于交互判断。
 - `current_message`：本轮 ASR 文本。
 - `speaker`：声纹身份（`speaker_id`、显示名、参与人编号、是否参与人）。
 - `session`：会话模型，含 `active`、`participant_count`、`topics`（当前话题列表）与 `recent_messages`（最近五条真实用户/助理消息）。
 - `wake_word_detected`、`assistant_speaking`、`has_pending_task`：信号位。
 
-`recent_messages` 是判断延续性追问的关键上下文。`topics` 目前是启发式：把最近被放行的用户发言按序去重保留，作为“房间在聊什么”的粗略信号。决策模型当前只做交互判断（是否面向 AI / 是否回应），暂不做话题归纳抽取；需要真正的 Topic 归纳时再接生成式后端（如 Hermes）。
+`recent_messages` 是判断延续性追问的关键上下文。`topics` 目前是启发式：把最近被放行的用户发言按序去重保留，作为“房间在聊什么”的粗略信号。决策模型当前只做交互判断（是否面向 AI / 是否回应），暂不做话题归纳抽取；需要真正的 Topic 归纳时再接生成式后端（可在对话 Agent 内或独立的 Topic 模型中实现）。
 
 延续性兜底：决策模型对“参与人在活跃窗口内、紧接助理回复之后的延续追问”（如天气回答后问“最近是不是有个台风啊”）处在判断边界，`should_respond` 会抖动甚至误判 silent。当决策模型判 `is_addressed_to_ai=True` 但 `should_respond=False`，且满足“参与人 + 会话活跃 + 窗口内有助理回复 + 文本像追问（命中 `assistant.followup_markers` 或以 `assistant.followup_sentence_finals` 结尾）”时，兜底强制进入回复流程。纯确认词（“嗯”“好的”）不命中追问特征，仍保持 silent；`is_addressed_to_ai=False`（人类互聊）不触发兜底。
 
-唤醒词和激活窗口是决策信号及模型异常时的保守回退，不再是连续对话的唯一入口；未加入的声纹仍不能被决策模型放行到 Hermes。
+唤醒词和激活窗口是决策信号及模型异常时的保守回退，不再是连续对话的唯一入口；未加入的声纹仍不能被决策模型放行到对话 Agent。
 
 默认唤醒词：
 
@@ -291,7 +291,7 @@ Breeze-TTS-2 的参考音频要求：
 - 单一说话人；
 - `ref_text` 与参考音频逐字一致。
 
-当前模式属于 Voice Direction：参考音频锁定说话人身份，Hermes 为每条回复生成的 `instruction` 控制语气、速度和情绪。该值沿 `/api/chat` → 前端消息 → `/api/tts` 传递；缺失时回退到 `config.yaml` 的 `tts.prompt`。`cfg_scale` 由 `tts.cfg_scale` 配置，默认使用官方建议值 `4` 以增强 instruction 遵循度。
+当前模式属于 Voice Direction：参考音频锁定说话人身份，direct-LLM Agent 为每条回复生成的 `instruction` 控制语气、速度和情绪。该值沿 `/api/chat` → 前端消息 → `/api/tts` 传递；缺失时回退到 `config.yaml` 的 `tts.prompt`。`cfg_scale` 由 `tts.cfg_scale` 配置，默认使用官方建议值 `4` 以增强 instruction 遵循度。
 
 ## 8. Session 管理
 
@@ -301,17 +301,17 @@ Breeze-TTS-2 的参考音频要求：
 - 当前远程 ASR session id；
 - 最近一次 ASR 累计结果；
 - `active_until`；
-- 当前 Session 的 Hermes 调用锁。
+- 当前 Session 的对话 Agent 调用锁（`chat_lock`）。
 
-助理的人设、对话上下文和历史由项目专用 Hermes agent 持久管理，不属于 backend Session。
+助理的人设由 `conversation_agent.SYSTEM_PROMPT` 与 `agent` 段共同决定；对话上下文（最近 5 条）由 backend Session 持有，进程内 direct-LLM Agent 是无状态的，按轮次接收上下文调用模型。
 
 Session 当前存放在进程内存中：
 
 - 刷新页面会创建新 Session；
-- 重启后端会丢失所有 Session；
+- 重启后端会丢失所有 Session 及其对话上下文；
 - 多实例部署时需要改为 Redis 或数据库。
 
-关键实现：`backend/session.py`。
+关键实现：`backend/session.py`、`backend/conversation_agent.py`。
 
 ## 9. 已知限制
 
@@ -319,8 +319,8 @@ Session 当前存放在进程内存中：
 2. 浏览器麦克风要求 localhost 或 HTTPS。
 3. Breeze-TTS-2 单并发，短时间内可能出现 409；持续 409 通常表示服务端版本旧或资源未释放。
 4. 当前门控主要依赖 ASR 文本、唤醒词和 Session 状态，不是声学 KWS。
-5. 环境语音仍会被 ASR 转写，但未触发门控时不会发给 Hermes agent。
-6. backend Session 尚未持久化；Hermes agent 的对话历史不受 backend Session 生命周期影响。
+5. 环境语音仍会被 ASR 转写，但未触发门控时不会进入对话 Agent。
+6. backend Session 尚未持久化；对话上下文随 Session 生命周期存亡。
 
 ## 10. 修改本文的时机
 

@@ -3,7 +3,7 @@ import array
 import wave
 
 from decision import InteractionDecision
-from session import HermesReply, Session, SpeakerIdentity, _pcm_to_wav, parse_hermes_reply
+from session import ChatReply, Session, SpeakerIdentity, _pcm_to_wav
 
 
 def _f32(frames):
@@ -197,47 +197,6 @@ def test_audio_refs_do_not_overwrite_each_other():
     assert session.get_voice_audio("a", ref_a) == b"a"
     assert session.get_voice_audio("b", ref_b) == b"b"
     assert session.get_voice_audio("a", ref_b) is None
-
-
-def test_parse_structured_reply():
-    reply = parse_hermes_reply(
-        '{"text":"我们慢慢来。","instruction":"用平静、安心的语气缓慢表达。"}'
-    )
-
-    assert reply == HermesReply(
-        text="我们慢慢来。",
-        instruction="用平静、安心的语气缓慢表达。",
-    )
-
-
-def test_parse_json_code_fence():
-    reply = parse_hermes_reply(
-        '```json\n{"text":"太好了！","instruction":"用明快、喜悦且富有感染力的语气表达。"}\n```'
-    )
-
-    assert reply.text == "太好了！"
-    assert reply.instruction == "用明快、喜悦且富有感染力的语气表达。"
-
-
-def test_parse_json_after_short_preamble():
-    reply = parse_hermes_reply(
-        '当然。\n{"text":"请留意前方。","instruction":"用克制、严肃的语气清晰表达，稍微放慢语速。"}'
-    )
-
-    assert reply.text == "请留意前方。"
-    assert reply.instruction == "用克制、严肃的语气清晰表达，稍微放慢语速。"
-
-
-def test_plain_text_reply_remains_compatible():
-    reply = parse_hermes_reply("这是旧版 Hermes 的纯文本回复。")
-
-    assert reply == HermesReply(text="这是旧版 Hermes 的纯文本回复。")
-
-
-def test_invalid_instruction_does_not_break_reply():
-    reply = parse_hermes_reply('{"text":"可以。","instruction":{"tone":"warm"}}')
-
-    assert reply == HermesReply(text="可以。")
 
 
 class StubDecisionClient:
@@ -475,7 +434,7 @@ def test_real_reply_is_added_to_context(monkeypatch):
     turn = evaluate(session, "a", "志玲你好", active=False)
 
     async def reply(_turn):
-        return HermesReply(text="你好。", instruction="平静")
+        return ChatReply(text="你好。", instruction="平静")
 
     monkeypatch.setattr(session, "_chat_reply", reply)
     result = asyncio.run(session.chat(turn.id))

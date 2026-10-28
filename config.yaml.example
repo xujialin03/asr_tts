@@ -35,7 +35,7 @@ database:
     password: change-me
 
 # 角色模型（AgentProfile）：注入决策模型交互判断，让模型知道“助手是谁”。
-# Hermes 在自己的 profile 里另有一份人设；这里只用于“是否面向 AI / 是否回应”的判断。
+# 进程内 direct-LLM agent 另有一份 SYSTEM_PROMPT 人设；这里只用于“是否面向 AI / 是否回应”的判断。
 agent:
   name: 志玲
   role: 语音助理
@@ -82,7 +82,7 @@ assistant:
   followup_sentence_finals: ["?", "？", "吗", "呢", "吧", "啊", "呀"]
 
 # 输入缓冲区：VAD 停顿会把一句话切成多段。决策模型判为“未说完”的残句会暂存，
-# 等待同一说话人的后续片段合并成完整句子后再发给 Hermes。
+# 等待同一说话人的后续片段合并成完整句子后再发给对话 Agent。
 buffer:
   enabled: true
   max_wait_seconds: 3.0   # 超过此时长未等到后续片段，则放弃合并、按原样处理
@@ -100,12 +100,8 @@ decision_model:
   enable_thinking: false
   max_retries: 3
 
-# Reply provider: use "hermes" for the dedicated agent, or "direct_llm" to
-# call an OpenAI-compatible chat model directly (without Hermes tools/skills).
-conversation:
-  provider: hermes
-
-# Required only when conversation.provider is direct_llm.
+# 对话回复由进程内 direct-LLM agent 提供（backend/conversation_agent.py），
+# 调用下面的 OpenAI 兼容模型。
 direct_llm:
   base_url: http://127.0.0.1:9090/v1
   model: your-model-id
@@ -115,14 +111,19 @@ direct_llm:
   temperature: 0.7
   enable_thinking: false
 
-hermes:
-  # Client for the dedicated Hermes agent. Hermes owns conversation history
-  # and persona; the backend also injects a per-turn JSON voice-output contract.
-  client_path: ~/worker_agent_client.py
-  timeout_seconds: 180
+# LeRobot SO101 局域网 MCP（Streamable-HTTP JSON-RPC）。由进程内 direct-LLM agent 使用；
+# enabled=true 且 token 非空时 teleop.* 技能才会注入系统提示词。
+# 同一服务暴露 9 个工具：4 个遥操 + 4 个推理 + 1 个双摄视觉问答。
+# start_teleoperation / start_inference 会使实体机械臂通电运动，属危险操作。
+# Token 等同遥操与推理控制权限：写在 gitignored 的 config.yaml 里，或用环境变量 TELEOP_MCP_TOKEN。
+teleop:
+  enabled: false
+  url: http://192.168.200.30:8791/mcp
+  token: ""
+  timeout_seconds: 30
 
 tts:
-  # Hermes 会为每条回复生成动态 instruction；prompt 仅在 Hermes 未返回时作为兜底。
+  # direct-LLM agent 会为每条回复生成动态 instruction；prompt 仅在未返回时作为兜底。
   prompt: "用温柔、自然、亲切的语气表达，语速适中。"
   # instruction 遵循强度；Breeze-TTS-2 Voice Direction 推荐使用 4。
   cfg_scale: 4

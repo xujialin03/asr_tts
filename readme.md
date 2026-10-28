@@ -1,10 +1,10 @@
 # 知玲 Zhiling
 
-一个浏览器端多人语音助手原型，串联 Qwen3-ASR、Silero VAD、CAM++ 声纹识别、决策模型（远程生成式）、Hermes agent 与 Breeze-TTS-2。
+一个浏览器端多人语音助手原型，串联 Qwen3-ASR、Silero VAD、CAM++ 声纹识别、决策模型（远程生成式）、进程内 direct-LLM 对话 Agent 与 Breeze-TTS-2。
 
 名字取自助手人设“志玲”，也涵盖 ASR 的同音误识别（诗林/志宁/志凌）——叫得准不准，它都认得你是在叫它。
 
-前端负责麦克风采集、免手持语音检测和流式音频播放；FastAPI 后端负责会话状态、决策模型调度、唤醒/打断门控、声纹解析以及远程服务代理。对话人设和历史由项目专用 Hermes agent 独占管理。
+前端负责麦克风采集、免手持语音检测和流式音频播放；FastAPI 后端负责会话状态、决策模型调度、唤醒/打断门控、声纹解析以及远程服务代理。对话人设和历史由 backend 进程内 direct-LLM Agent 独占管理。
 
 ## 功能
 
@@ -13,7 +13,7 @@
 - 🔔 **关键词唤醒**：冷启动时由 sherpa-onnx 声学 KWS 或 ASR 文本唤醒词激活助手；KWS 不可用时可降级为文本唤醒。
 - 💬 **连续对话**：激活后在配置的时间窗口内无需重复唤醒，TTS 播放期间会自动延长窗口。
 - ✋ **语音打断**：AI 播放期间先完成 ASR，再根据打断词确认是否停止播放，减少环境声音造成的误打断。
-- 🗣️ **Hermes 对话**：项目专用 Hermes agent 管理助理人设、上下文和对话历史，并为每条回复输出适配内容的 TTS 语气指令。
+- 🗣️ **对话 Agent**：进程内 direct-LLM Agent 管理助理人设、上下文和对话历史，并为每条回复输出适配内容的 TTS 语气指令。
 - 🔊 **流式语音回复**：Breeze-TTS-2 返回裸 PCM，浏览器边接收边播放；支持自动朗读、单条重播和停止播放。
 - 👥 **多人声纹侦听**：开启 VAD 后持续侦听，每段语音都会解析声纹身份；当前多人支持多人轮流发言，不含重叠讲话的说话人分离。
 
@@ -28,7 +28,7 @@
 - 关键词唤醒：独立可选的 sherpa-onnx 中文 KWS 服务
 - 声纹识别：CAM++ 服务 + PostgreSQL
 - 交互决策：远程 OpenAI 兼容生成式决策模型（默认 `qwen3.6-35b-awq`，可换端点）
-- 对话 Agent：项目专用 Hermes agent
+- 对话 Agent：进程内 direct-LLM Agent（调用 OpenAI 兼容聊天模型）
 - 语音合成：远程 Breeze-TTS-2 流式合成服务
 - 本地服务编排：Docker Compose
 
@@ -44,7 +44,7 @@ FastAPI backend
   ├─ /api/transcribe ──────────────────▶ 远程 Qwen3-ASR（VAD 整段转写）
   ├─ /api/kws/detect ──────────────────▶ 本地 sherpa-onnx KWS
   ├─ /api/session/.../turns/evaluate ──▶ 声纹解析 + 决策模型判断 + 唤醒/打断门控
-  ├─ /api/chat ────────────────────────▶ 项目专用 Hermes agent
+  ├─ /api/chat ────────────────────────▶ 进程内 direct-LLM 对话 Agent
   └─ /api/tts ─────────────────────────▶ 远程 Breeze-TTS-2
 ```
 
@@ -55,7 +55,7 @@ FastAPI backend
 ## 目录结构
 
 ```text
-backend/              FastAPI 后端、Hermes 调用和上游服务代理
+backend/              FastAPI 后端、direct-LLM 对话 Agent 和上游服务代理
 frontend/             Vue 3 + Vite 前端
 voiceprint-service/   CAM++ 声纹识别与用户管理服务
 kws-service/          sherpa-onnx 关键词唤醒服务
@@ -71,9 +71,9 @@ config.yaml.example   应用配置模板
 - Node.js 与 npm
 - Docker 与 Docker Compose（`compose.yaml` 自带 PostgreSQL、声纹与 KWS 服务）
 - 可访问的 Qwen3-ASR 与 Breeze-TTS-2 服务
-- 可调用的项目专用 Hermes agent client
+- 可访问的 OpenAI 兼容对话模型（direct-LLM Agent 使用）
 
-如果只调试部分链路，KWS 可关闭。每段语音都会解析声纹身份；声纹服务不可用、音频过短或识别失败时，本段会 fail closed，不会发送给 Hermes。
+如果只调试部分链路，KWS 可关闭。每段语音都会解析声纹身份；声纹服务不可用、音频过短或识别失败时，本段会 fail closed，不会进入对话 Agent。
 
 ## 配置
 
@@ -93,11 +93,12 @@ cp .env.example .env
 - `services.voiceprint`：本地声纹服务地址
 - `services.kws`：KWS 地址、启用状态与失败降级策略
 - `database.postgresql`：项目使用的 PostgreSQL 连接信息
-- `agent`：角色模型（AgentProfile），注入决策模型交互判断，让模型知道"助手是谁"
+- `agent`：角色模型（AgentProfile），注入决策模型交互判断，让模型知道"助手是谁"；进程内 direct-LLM Agent 另有一份 `conversation_agent.SYSTEM_PROMPT` 人设
 - `assistant`：唤醒词、连续对话窗口和打断正则
 - `decision_model`：交互决策模型地址、模型名、超时、思考开关和重试次数
-- `hermes`：Hermes client 路径和超时时间
-- `tts`：Hermes 未返回动态语气时的兜底提示词、`cfg_scale`、参考音频及其文本
+- `direct_llm`：对话 Agent 使用的 OpenAI 兼容聊天模型（`base_url`、`model`、`api_key`、`timeout_seconds`、`max_tokens`、`temperature`、`enable_thinking`）
+- `teleop`：LeRobot SO101 局域网 MCP（`url`/`token`/`enabled`/`timeout_seconds`），同服务暴露 9 个工具（4 遥操 + 4 推理 + 1 双摄视觉问答），`enabled=true` 且 token 非空时以 `teleop.*` 技能注入系统提示词，由进程内 direct-LLM Agent 调用；token 写进 gitignored 的 `config.yaml`，或用环境变量 `TELEOP_MCP_TOKEN`
+- `tts`：对话 Agent 未返回动态语气时的兜底提示词、`cfg_scale`、参考音频及其文本
 
 后端默认读取仓库根目录的 `config.yaml`；可以通过 `CONFIG_PATH` 环境变量指定其他路径。`tts.ref_audio` 的相对路径以 `backend/` 为基准。
 
@@ -184,7 +185,7 @@ npm run dev
 2. ASR 与 KWS 并行处理；
 3. 后端解析声纹身份（每段语音都会解析，无参与资格门槛）；
 4. 决策模型结合上下文与说话人判断是否回应（normal / brief / silent）；
-5. 命中回应时调用 Hermes 生成回复，并流式 TTS 朗读；
+5. 命中回应时由进程内 direct-LLM Agent 生成回复，并流式 TTS 朗读；
 6. 决策模型异常时回退到唤醒词与连续对话窗口门控。
 
 外放的 TTS 可能被麦克风重新采集，建议开启 VAD 时使用耳机。关闭 VAD 开关后浏览器会释放麦克风。
@@ -200,7 +201,7 @@ npm run dev
 | `GET` | `/api/session/{id}` | 查询激活状态与侦听到的声音 |
 | `POST` | `/api/session/{id}/turns` | 在 speech-start 创建不可变语音轮次 |
 | `POST` | `/api/session/{id}/turns/{turn_id}/evaluate` | 解析声纹、调用决策模型并执行唤醒/打断门控 |
-| `POST` | `/api/chat` | 消费已获准的 `turn_id` 并发送给 Hermes |
+| `POST` | `/api/chat` | 消费已获准的 `turn_id` 并交给进程内对话 Agent 生成回复 |
 | `POST` | `/api/touch` | 延长连续对话激活窗口 |
 | `POST` | `/api/tts` | 代理流式 TTS PCM |
 
@@ -209,7 +210,7 @@ FastAPI 后端还提供声纹用户和模板管理代理接口，详细契约见
 ## 上游音频协议
 
 - ASR 输入：浏览器 VAD 产出 little-endian float32 PCM、16kHz、单声道片段；后端将其转成 16-bit PCM WAV，通过 `POST {asr.base_url}/audio/transcriptions`（multipart，带 `model` 字段）一次性提交转写。
-- TTS 请求：Hermes 每轮返回 `text` 和动态 `instruction`；后端以 `multipart/form-data` 调用 `/v1/audio/speech`，并附带 `instruction`、配置的 `cfg_scale`、`ref_audio` 和 `ref_text`。Hermes 未返回有效 `instruction` 时回退到 `tts.prompt`。
+- TTS 请求：对话 Agent 每轮返回 `text` 和动态 `instruction`；后端以 `multipart/form-data` 调用 `/v1/audio/speech`，并附带 `instruction`、配置的 `cfg_scale`、`ref_audio` 和 `ref_text`。Agent 未返回有效 `instruction` 时回退到 `tts.prompt`。
 - TTS 响应：`audio/pcm` 裸 PCM、16-bit、单声道，采样率由上游 `/health` 返回（当前默认 24000Hz）；后端通过 `X-Sample-Rate` 响应头传给前端。
 - Breeze-TTS-2 上游只支持单并发，后端通过锁避免同时发起多个合成请求。
 
@@ -224,11 +225,33 @@ FastAPI 后端还提供声纹用户和模板管理代理接口，详细契约见
 
 ## 更新记录
 
-### 2026-10-27 · ASR 整段转写化 + 接入 MCP 前快照
+### 2026-10-27 · 移除 Hermes worker，对话统一由进程内 direct-LLM Agent 提供
+
+- **去除 Hermes worker 依赖**：删除 `backend/session.py` 中的 `_chat_hermes` 子进程调用路径与 `parse_hermes_reply`/`VOICE_RESPONSE_CONTRACT`，`_chat_reply` 直接走进程内 `VoiceConversationAgent`。`config.py` 移除 `HERMES_CLIENT_PATH`/`HERMES_TIMEOUT_SECONDS` 与 `CONVERSATION_PROVIDER` 切换；`config.yaml(.example)` 删除 `conversation:` 与 `hermes:` 段。
+- **类型改名**：`HermesReply` → `ChatReply`（仅作内部数据载体；`conversation_agent.AgentReply` 是带 `preferred_name` 的更宽版本，session 层 `ChatReply` 只取 `text`/`instruction`）。
+- **前端文案**：header 与决策面板的「Hermes」改为「LLM」，`recordTiming("hermes")` 改为 `recordTiming("chat")`，相关注释同步。
+- **历史条目保留**：下方旧更新记录里的 Hermes 字样属于历史，未改写。
+
+### 2026-10-27 · 语音助手扩展至 LeRobot 全部 9 个 MCP 工具
+
+- **从 4 个遥操工具扩展到 9 个**：`backend/teleop_skill.py` 现注册全部 `teleop.*` 技能——遥操 4 个（`start_teleoperation`/`stop_teleoperation`/`get_teleoperation_status`/`get_joint_curves`）、推理 4 个（`start_inference`/`stop_inference`/`get_inference_status`/`unload_inference_model`）、双摄视觉问答 1 个（`ask_camera_vision`）。9 个工具共用同一 MCP 服务、同一 token、同一 `TELEOP_ENABLED` 开关。技能定义按线上 `tools/list` 的真实 inputSchema 对齐（含 `instruction`/`question` 等必填、字符串与布尔类型）。
+- **参数校验泛化**：`_validate` 由「只支持数值 min/max」改为按 schema 类型分别校验 integer/number/string(minLength-maxLength)/boolean，并强制 `required`。`start_teleoperation` 兜底摘要兼容 v1.3 的 `start_status`/`feedback.parameters` 新返回结构。
+- **推理与视觉结果转述**：`_narration_payload` 新增推理状态分支（只保留 `phase`/`running`/`resident`/`total_dispatches` 等关键字段，丢弃体量很大的 `log_tail`）和视觉问答分支（透传 `answer` 并继续脱敏 URL token）。
+- **提示词安全规则扩展**：`TELEOP_RULES` 明确 `start_inference` 同样属通电运动危险操作、需先确认现场安全；`instruction` 仅传用户自然语言任务、不得替用户指定模型/Corrector；异常时遥操用 `stop_teleoperation`、推理用 `stop_inference`；`ask_camera_vision` 不动机械臂但会把截图发往外部视觉模型。
+- `config.yaml.example` 与 `readme` 注释同步更新为「9 个工具」口径。
+
+### 2026-10-27 · 接入 LeRobot SO101 遥操 MCP
+
+- **direct_llm Agent 接入遥操技能**：`backend/teleop_skill.py` 以极简 JSON-RPC 客户端直连 MCP 服务（`http://192.168.200.30:8791/mcp`，Streamable-HTTP、无会话、每请求一次 POST），暴露 4 个项目技能：`teleop.start_teleoperation`、`teleop.stop_teleoperation`、`teleop.get_teleoperation_status`、`teleop.get_joint_curves`。不引入 MCP SDK，复用 httpx，与 `voiceprint_skill.py` 同构。
+- **技能列表可插拔**：`conversation_agent.py` 的系统提示词按 `config.TELEOP_ENABLED` 动态注入技能定义与遥操安全规则；`_execute_actions` 按技能名路由到 `VoiceprintManagementSkill` 或 `TeleopMCPSkill`。
+- **二段转述**：遥操查询/启动类动作会真实返回数据，原先单趟「文本+动作」拿不到结果。`respond` 在动作执行后追加一次模型转述（`_narrate_tool_result`），把 `structuredContent` 压缩成口语化播报；转述失败时回退到 skill 自带的摘要。`voiceprint` 动作仍为单趟无结果。
+- **Token 与 URL 不泄漏**：视频流/看板地址含 Bearer token，转述前经 `_redact_tokens` 去除 `?token=`，模型被要求只说「可在综合看板查看」、不念 URL。真实 token 仅存 gitignored 的 `config.yaml`（或 `TELEOP_MCP_TOKEN` 环境变量）。
+- **危险操作门控**：`start_teleoperation` 会让实体机械臂通电运动。提示词要求先向用户确认现场安全才可调用，参数范围（fps 1–60、servo_hz 1–120、seconds 1–120）在 skill 层强制校验，单轮最多一个动作。
+
+### 2026-10-27 · ASR 整段转写化 + 进程内 Agent 抽离
 
 - **ASR 改为 OpenAI 兼容网关整段转写**：移除自定义流式协议（`/api/start`、`/api/chunk`、`/api/finish` 端点与远程 ASR session）。VAD 产出的完整语音片段由后端转成 16-bit PCM WAV，一次性 POST 到 `{asr.base_url}/audio/transcriptions`。`config.yaml` 的 `services.asr` 相应改为 `base_url`（带 `/v1`）+ `model` + `api_key` + `timeout_seconds`。
 - **direct_llm 对话逻辑抽离为进程内 Agent**：原先内联在 `Session` 里的系统提示词、消息拼装、模型调用与技能执行下沉到 `backend/conversation_agent.py` 的 `VoiceConversationAgent`；`Session` 只负责构造 `AgentTurn` 并按返回的 `preferred_name` 更新声纹画像。
-- 此为接入设备 MCP（LeRobot SO101 遥操）之前的基线快照。
 
 ### 2026-10-20 · 决策模型化 + 去参与者
 

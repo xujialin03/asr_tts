@@ -231,8 +231,8 @@ async function sendToLLM(turnId, speaker) {
     const sid = await ensureSession();
     const result = await chat(sid, turnId);
     const reply = result.reply;
-    console.info(`[Voice timing] Hermes ${Math.round(performance.now() - chatStartedAt)}ms`);
-    recordTiming("hermes", chatStartedAt, { turnId });
+    console.info(`[Voice timing] chat ${Math.round(performance.now() - chatStartedAt)}ms`);
+    recordTiming("chat", chatStartedAt, { turnId });
     updateActive(result);
     messages.value.push({
       role: "assistant",
@@ -260,8 +260,8 @@ const MAX_VAD_QUEUE = 4;
 // the conversation has moved on, so replaying old fragments yields confusing
 // replies. A queued segment older than this is treated as stale backlog.
 const VAD_QUEUE_STALE_MS = 6000;
-// Hermes replies run off the VAD pipeline: chained so they stay ordered and
-// one-at-a-time, but never awaited by the drain loop. A slow or hung Hermes call
+// Chat replies run off the VAD pipeline: chained so they stay ordered and
+// one-at-a-time, but never awaited by the drain loop. A slow or hung chat call
 // must not stop the mic from transcribing/evaluating the next utterance.
 let replyChain = Promise.resolve();
 
@@ -309,7 +309,7 @@ async function handleEvaluatedTurn(decision, recognizedText) {
 
   const replyText = (decision.reply_text || recognizedText).trim();
   appendUserMessage(replyText, identity);
-  // Chain the Hermes reply off the VAD pipeline. The drain loop returns as soon
+  // Chain the chat reply off the VAD pipeline. The drain loop returns as soon
   // as the turn is evaluated, so the mic keeps listening even if this reply is
   // slow or hangs. Chaining keeps replies ordered and one-at-a-time.
   replyChain = replyChain.then(() => sendToLLM(decision.turn_id, identity));
@@ -518,7 +518,7 @@ onBeforeUnmount(() => {
       <header class="app-header">
         <div>
           <h1>语音助手</h1>
-          <p>ASR · KWS · 声纹 · Hermes · TTS</p>
+          <p>ASR · KWS · 声纹 · LLM · TTS</p>
         </div>
         <div class="row status-row">
           <span class="pill" :class="status">{{ statusText }}</span>
@@ -734,10 +734,10 @@ onBeforeUnmount(() => {
                 decisionDebug.interrupt
                   ? "命中打断，停止播放"
                   : decisionDebug.should_reply
-                    ? "送入 Hermes 生成回复"
+                    ? "送入 LLM 生成回复"
                     : decisionDebug.fallback
                       ? "决策模型异常，已用传统门控"
-                      : "仅显示识别文本，不调用 Hermes"
+                      : "仅显示识别文本，不调用 LLM"
               }}
             </span>
           </div>

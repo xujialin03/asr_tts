@@ -1,8 +1,8 @@
 """Backend for the voice-chat pipeline.
 
-Relays the remote Qwen3-ASR and Breeze-TTS services and sends assistant turns
-to the dedicated Hermes agent. Local sessions keep only ASR and interaction
-state; Hermes owns the assistant conversation history.
+Relays the remote Qwen3-ASR and Breeze-TTS services and answers assistant turns
+with the in-process direct-LLM agent. Local sessions own the ASR, interaction,
+and conversation state.
 
 Frontend flow:
   POST /api/session/start   -> create local interaction session -> {session_id}
@@ -78,7 +78,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "asr": config.ASR_BASE_URL,
-        "assistant": "hermes",
+        "assistant": config.DIRECT_LLM_MODEL or "direct_llm",
         "tts": config.TTS_BASE_URL,
         "kws": config.KWS_BASE_URL if config.KWS_ENABLED else "disabled",
     }
@@ -507,7 +507,7 @@ async def chat(req: ChatReq) -> JSONResponse:
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Hermes call failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"chat reply failed: {exc}") from exc
     turn = s.get_turn(req.turn_id)
     return JSONResponse(
         {

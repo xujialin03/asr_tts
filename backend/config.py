@@ -1,7 +1,7 @@
 """Load service config from the repo-root config.yaml.
 
 config.yaml lives one level above the backend package. It holds the ASR/TTS
-service addresses, Hermes client settings, and TTS voice prompt.
+service addresses, the direct-LLM chat settings, and the TTS voice prompt.
 """
 
 from __future__ import annotations
@@ -52,20 +52,9 @@ POSTGRES_DATABASE = _postgresql.get("database", "qwen3_asr")
 POSTGRES_USER = _postgresql.get("user", "qwen3_asr")
 POSTGRES_PASSWORD = _postgresql.get("password", "")
 
-_hermes = _cfg.get("hermes", {})
-HERMES_CLIENT_PATH = os.path.expanduser(
-    _hermes.get("client_path", "~/worker_agent_client.py")
-)
-HERMES_TIMEOUT_SECONDS = float(_hermes.get("timeout_seconds", 180))
-
-# Conversation replies can be served by the dedicated Hermes worker or directly
-# by an OpenAI-compatible model. The latter is useful while the Hermes worker is
-# unavailable; it retains only backend session context and cannot run Hermes
-# skills (such as persistent voice-profile naming).
-_conversation = _cfg.get("conversation", {})
-CONVERSATION_PROVIDER = _conversation.get("provider", "hermes")
-if CONVERSATION_PROVIDER not in {"hermes", "direct_llm"}:
-    raise ValueError("conversation.provider must be 'hermes' or 'direct_llm'")
+# Conversation replies are served by the in-process direct-LLM agent, which calls
+# an OpenAI-compatible chat model (see direct_llm below); the backend owns all
+# conversation state and history.
 _direct_llm = _cfg.get("direct_llm", {})
 DIRECT_LLM_BASE_URL = _direct_llm.get("base_url", "http://127.0.0.1:9090/v1").rstrip("/")
 DIRECT_LLM_MODEL = _direct_llm.get("model", "")
@@ -75,12 +64,23 @@ DIRECT_LLM_MAX_TOKENS = int(_direct_llm.get("max_tokens", 512))
 DIRECT_LLM_TEMPERATURE = float(_direct_llm.get("temperature", 0.7))
 DIRECT_LLM_ENABLE_THINKING = bool(_direct_llm.get("enable_thinking", False))
 
+# LeRobot SO101 teleop MCP (Streamable-HTTP JSON-RPC). The direct-LLM agent can
+# start/stop teleop and read status/joint curves through this server. It moves a
+# physical robot, so TELEOP_ENABLED requires both an explicit opt-in and a token.
+# The token lives in config.yaml (gitignored) or TELEOP_MCP_TOKEN in the env.
+_teleop = _cfg.get("teleop", {})
+TELEOP_MCP_URL = str(_teleop.get("url", "")).strip()
+TELEOP_MCP_TOKEN = os.getenv("TELEOP_MCP_TOKEN") or str(_teleop.get("token", "")).strip()
+TELEOP_TIMEOUT_SECONDS = float(_teleop.get("timeout_seconds", 30))
+TELEOP_ENABLED = bool(_teleop.get("enabled", False)) and bool(
+    TELEOP_MCP_URL and TELEOP_MCP_TOKEN
+)
+
 _agent = _cfg.get("agent", {})
 AGENT_NAME = _agent.get("name", "志玲")
 AGENT_ROLE = _agent.get("role", "语音助理")
 # Persona injected into the decision-model state so the model knows who the
-# assistant is when judging whether a turn is addressed to it. Hermes keeps its
-# own persona in its profile; this copy is only for interaction decisions.
+# assistant is when judging whether a turn is addressed to it.
 AGENT_PERSONA = " ".join(str(_agent.get("persona", "")).split()) or (
     f"你叫{AGENT_NAME}，是一名{AGENT_ROLE}，正在多人语音房间中通过麦克风听取用户发言。"
 )

@@ -1,6 +1,6 @@
 # 本地声纹与用户服务
 
-该服务使用 CAM++ 模型 `iic/speech_campplus_sv_zh-cn_16k-common` 提取 192 维说话人向量。声纹服务只负责解析稳定身份；是否能参与当前对话由 FastAPI backend 的会话参与人状态决定。首位唤醒者会自动加入，激活期间识别到的其他身份只进入侦听列表，用户手动加入后才可进入 Hermes。
+该服务使用 CAM++ 模型 `iic/speech_campplus_sv_zh-cn_16k-common` 提取 192 维说话人向量。声纹服务只负责解析稳定身份；是否能参与当前对话由 FastAPI backend 的会话参与人状态决定。首位唤醒者会自动加入，激活期间识别到的其他身份只进入侦听列表，用户手动加入后才会进入对话 Agent。
 
 ## 设计
 
@@ -59,7 +59,7 @@ Body: float32 PCM, 16 kHz, mono
 - 落在不确定区间（`uncertain_threshold <= score < accept_threshold`）：判定为**老用户声音漂移**（离麦远、嗓音状态变化等），默认把这段作为该身份的**又一个声纹模板**追加（`auto_enroll_uncertain=true`，见 `app/settings.py`），返回同一 `speaker_id`、`created: false`、`decision: "uncertain"`、`template_added: true`。这样同一个人越用越容易被认出，不会被重新建档成"访客"、导致助手反复追问身份。把 `auto_enroll_uncertain` 设为 `false` 可退回"不确定也新建"的旧行为。
 - 低于不确定阈值（`score < uncertain_threshold`）或库为空：在一个数据库事务中创建匿名用户及首个声纹模板，返回新 `speaker_id`、`created: true`、`decision: "unknown"`。
 - 未通过唤醒门控的环境语音不会调用解析，自然也不会建档。
-- 身份建档由程序完成；Hermes 后续可以用 `speaker_id` 补充姓名、称呼和偏好，但不负责判定声纹是否相同。
+- 身份建档由程序完成；对话 Agent 后续可以用 `speaker_id` 补充姓名、称呼和偏好，但不负责判定声纹是否相同。
 
 > 冷启动：库为空时第一段被解析的声音即被建档为第一个身份（`created: true`），后续该人说话走 matched/uncertain。无需预先建档或 UI 登记——见下文"唤醒问候与姓名绑定"。
 
@@ -80,40 +80,18 @@ Body: float32 PCM, 16 kHz, mono
 }
 ```
 
-## Hermes 语音管理
+## 称呼管理（direct-LLM Agent 的声纹技能）
 
-当前项目使用的 Hermes `worker` profile 已安装 `voiceprint-management` skill。每次通过门控的语音在发送给 Hermes 前，后端会附加受信任的机器上下文：
+backend 进程内 direct-LLM Agent 通过受限的项目内 `voiceprint-management` skill 管理当前发言人称呼。Agent 每轮收到受信任的 `VOICE_CONTEXT`：
 
 ```text
-[VOICE_CONTEXT]{"session_id":"...","turn_id":"...","speaker":{"speaker_id":"...","participant_number":1},"participants":[...],"audio_ref":"..."}[/VOICE_CONTEXT]
+[VOICE_CONTEXT]{"session_id":"...","turn_id":"...","wake_event":false,"joined_session":true,"speaker":{"speaker_id":"...","display_name":"访客 xxxx","preferred_name":null,"identity_named":false},"should_ask_name":true,"response_type":"normal"}[/VOICE_CONTEXT]
 ```
 
-- `speaker.speaker_id` 表示当前已获准轮次的发言人，用于查询和更新当前身份。
-- `speaker.participant_number` 是当前会话内稳定编号；`participants` 只包含已加入者，不包含侦听到的陌生声音。
-- `audio_ref` 是当前 VAD 音频的短期不透明引用，约五分钟后失效，并且只能用于对应身份。
-- Hermes 通过 `python3 backend/voiceprintctl.py` 调用后端，不直接连接 PostgreSQL。
-- 添加当前声音、查询、命名和列出模板可以直接执行；删除模板、全部声纹或整个身份必须先说明影响并在下一轮取得明确确认。
-
-支持的自然语言示例：
-
-- “我是谁？”
-- “我叫许老板，以后叫我许老板。”
-- “把我现在这段声音添加为一个声纹模板，叫客厅麦克风。”
-- “我有几个声纹模板？”
-- “有哪些声纹用户？”
-- “删除我的全部声纹。”（Hermes 会先确认）
-
-`voiceprintctl.py` 也可供人工维护：
-
-```bash
-python3 backend/voiceprintctl.py list
-python3 backend/voiceprintctl.py show --speaker-id '<speaker_id>'
-python3 backend/voiceprintctl.py templates --speaker-id '<speaker_id>'
-```
-
-### 直连 LLM 模式的项目内声纹技能
-
-当 `config.yaml` 的 `conversation.provider` 设为 `direct_llm` 时，不经过 Hermes；backend 会把受限的项目内 `voiceprint-management` skill 以 JSON action 契约提供给模型。
+- `speaker.speaker_id` 表示当前已获准轮次的发言人；Agent 调用声纹技能时由 backend 绑定为该身份，模型不能传入、更换或枚举任意 `speaker_id`。
+- `wake_event` / `joined_session`：本轮是否由唤醒词加入会话，用于决定是否首次询问称呼。
+- `should_ask_name`：当前身份未命名且本会话未追问过时为 true，Agent 据此自然地问一次「我该怎么称呼你？」。
+- 称呼持久化走声纹服务 `PATCH /v1/users/{speaker_id}`，不直连数据库。
 
 当前只开放一个低风险动作：
 
@@ -122,27 +100,37 @@ voiceprint.set_current_preferred_name(preferred_name)
 ```
 
 - 仅当用户明确自报称呼（“我叫 X”“叫我 X”）时模型才可请求该动作；
-- skill 的目标 `speaker_id` 由 backend 绑定为**当前已经通过声纹门控的 turn**，模型不能传入、更换或枚举任意身份；
-- backend 校验称呼格式后，通过声纹服务 `PATCH /v1/users/{current_speaker_id}` 持久化 `preferred_name`，并同步当前 Session；
-- 不开放删除用户、删除模板、添加模板、查询其他身份等动作；这些仍需 Hermes skill 或人工 CLI 管理。
+- backend 校验称呼格式（1–32 个中英文/数字/下划线字符）后持久化 `preferred_name`，并同步当前 Session 的身份资料；
+- 不开放删除用户、删除模板、添加模板、查询其他身份等动作。
 
-因此直连模式也支持完整的自然闭环：匿名访客被唤醒 → 志玲问一次称呼 → 用户说“我是许老板” → 立即存为 `preferred_name: "许老板"` → 后续识别到同一声纹会使用该称呼。
+支持的自然语言示例：
+
+- “我是谁？”
+- “我叫许老板，以后叫我许老板。”
+- “有哪些声纹用户？”（未开放，会拒答）
+- “删除我的全部声纹。”（未开放，会拒答）
+
+因此也支持完整的自然闭环：匿名访客被唤醒 → 志玲问一次称呼 → 用户说“我是许老板” → 立即存为 `preferred_name: "许老板"` → 后续识别到同一声纹会使用该称呼。
+
+### 人工维护 CLI
+
+`voiceprintctl.py` 供人工查看和维护声纹数据（模型不会调用它）：
+
+```bash
+python3 backend/voiceprintctl.py list
+python3 backend/voiceprintctl.py show --speaker-id '<speaker_id>'
+python3 backend/voiceprintctl.py templates --speaker-id '<speaker_id>'
+```
 
 ### 唤醒问候与姓名绑定
 
-后端会在受信任的 `VOICE_CONTEXT` 中额外提供：
-
-- `wake_event`：本轮是否从未激活状态刚刚被唤醒；连续对话中为 `false`。
-- `identity_named`：当前身份是否已有用户提供的名称；自动生成的 `访客 xxxxxxxx` 不算已命名。
-- `display_name` / `preferred_name`：当前可靠称呼。
-
-Hermes 按以下流程处理：
+`VOICE_CONTEXT` 中的 `wake_event`、`identity_named`、`should_ask_name` 共同驱动问候与询问称呼：
 
 ```text
 冷启动唤醒 + 未命名身份
-  → 回应用户，并询问如何称呼
+  → 回应用户，并询问如何称呼（should_ask_name=true）
   → 下一轮“我是 X / 我叫 X / 叫我 X”
-  → 调用 voiceprintctl rename 更新同一个 speaker_id
+  → Agent 调用 voiceprint.set_current_preferred_name 更新同一个 speaker_id
 
 冷启动唤醒 + 已命名身份
   → 使用 preferred_name（否则 display_name）自然问候
