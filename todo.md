@@ -7,3 +7,18 @@
     - 忙时不重复发送：已有（后端 TTS_LOCK + 分段串行 + stopPlayback 抢占）
     - 409 退避重试一次：`ttsPlayer.js`（400ms 后重试，仍失败才报错）
     - 只播最新：已是抢占式（新回复 stopPlayback 掐旧播放）
+- TSE 重叠讲话支持（分支 `0.1.2_tse_test`）：未实现，可行性已验证
+    - 现状：代码零落地。`evaluate_turn` 是「1 段音频 → 1 个 identity → 1 条 text」，重叠被当作一个混合片段（readme 已列为已知限制）。实测印证：不分离时混合音频对说话人1 的 CAM++ cos 仅 0.048（远低于 identify 阈值 0.55，会被判未知/被另一人吞掉）
+    - 已选路线：`MossFormer2_SS_16K`（ClearerVoice-Studio，PyTorch 非 onnx）盲分离出 N 路 → 每路各跑一次 CAM++ 认人（命中即姓名，不命中标「未知1/未知2」）+ 各跑一次 ASR。纯音频 enrollment-TSE（给定声纹只抽那人）无中文现货权重：ModelScope `speech_mossformer2_target_speaker_extraction_temporal_8k` 是空壳页；ClearVoice 的 TSE 只有音视频版 `AV_MossFormer2_TSE_16K`（要唇动，用不了）
+    - 实测结论（mac, 3.72s 二人混合）：输出 shape `(2, 1, 59444)`、原生 16k 对齐现有管线；分离后两路 cos 分别 0.805 / 0.796，双双超阈值干净认回二人 → 「SS 分离 + 复用现有 CAM++」成立，不需要新模型或训练
+    - 两个确定约束：① **非流式**（config `num_spks: 2` 架构写死，整段一次算完）——但 VAD 已切整段上传，接口接得上，流式不是阻塞点；② **路数固定 2/3**，不会自动判断人数，1 人说话也会硬拆出空路，需按能量/声纹置信度丢路
+    - 已否决：「减掉一个人再跑一次」的循环。误差会滚雪球（残差是分布外输入、两路 mask 非互补 `m1+m2≠1`、跨轮次无说话人对齐保证）。真要抬人数上限应换 3-spk 权重跑一次，而不是叠 2 路模型
+- 待办 1：在服务器（A100 40G）上部署分离模型为独立服务
+    - 为什么上 GPU：mac 实测 4.08s 处理 3.72s 音频（RTF≈1.1，比实时还慢），现有声纹服务是 `VOICEPRINT_DEVICE: cpu`——CPU 跑 MossFormer2 这种重型 Transformer 满足不了「和现在一样快」。A100 待实测拿真实延迟，不预设数字
+    - 做法：仿 `voiceprint-service/` 新建 `separation-service/`（同为 FastAPI + 裸 float32 PCM 16k 进出 + 模型挂卷），Docker base 换 `nvidia/cuda`、`docker run --gpus all`、compose 申请 nvidia device
+    - 官方链接：https://github.com/modelscope/ClearerVoice-Studio ｜ pip 包 https://pypi.org/project/clearvoice/ ｜ 16k 配置 `clearvoice/clearvoice/config/inference/MossFormer2_SS_16K.yaml` ｜ 工具链论文 arxiv.org/abs/2506.19398
+- 待办 2：改代码支持 TSE 功能（三处改动，目前都没做）
+    - `separation-service`：新增，mix 进 → N 路 wav 出
+    - `backend/main.py:373` evaluate 路由：`_identify_speaker` 之后插入分离调用，对每路各调一次 `_identify_speaker`（复用现成函数）+ 一次 ASR，调用次数从 1×ASR+1×声纹 变成 N×(ASR+声纹)+1×分离
+    - `backend/session.py` 数据模型：`VoiceTurn` / `evaluate_turn`（`session.py:590`）从单 `text`/单 `speaker` 扩为可承载多条带标签结果，或一轮内拆成多个子 turn
+    - 最小验证版选项：先不动单说话人主链路，单开一个 `/api/separate-demo` 端点把「分离 → 逐路认人」跑通看效果，确认质量后再决定是否进主链路

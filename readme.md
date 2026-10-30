@@ -16,6 +16,7 @@
 - 🗣️ **对话 Agent**：进程内 direct-LLM Agent 管理助理人设、上下文和对话历史，并为每条回复输出适配内容的 TTS 语气指令。
 - 🔊 **流式语音回复**：Breeze-TTS-2 返回裸 PCM，浏览器边接收边播放；支持自动朗读、单条重播和停止播放。
 - 👥 **多人声纹侦听**：开启 VAD 后持续侦听，每段语音都会解析声纹身份；当前多人支持多人轮流发言，不含重叠讲话的说话人分离。
+- 🪗 **三级缓冲与积压保护**：输入（VAD 串行队列）、回复（LLM 回复队列）与合成（TTS 单并发退避）逐级设界；积压时丢弃过时片段，慢或卡住的模型调用不会阻塞麦克风继续听下一段。
 
 > 交互状态机和设计约束见 [语音交互详细设计](docs/voice-interaction-design.md)。
 
@@ -204,6 +205,8 @@ npm run dev
 | `POST` | `/api/chat` | 消费已获准的 `turn_id` 并交给进程内对话 Agent 生成回复 |
 | `POST` | `/api/touch` | 延长连续对话激活窗口 |
 | `POST` | `/api/tts` | 代理流式 TTS PCM |
+| `POST` | `/api/session/{id}/performance` | 记录一轮各阶段耗时埋点（`asr_kws` / `voice_gate` / `chat` 及 TTS 播放、`tts_busy_retry` 事件） |
+| `GET` | `/api/session/{id}/performance` | 查询 session 的流程耗时埋点记录 |
 
 FastAPI 后端还提供声纹用户和模板管理代理接口，详细契约见 [声纹服务文档](docs/voiceprint-service.md)。
 
@@ -224,6 +227,13 @@ FastAPI 后端还提供声纹用户和模板管理代理接口，详细契约见
 - KWS 默认 `fail_open: true` 表示服务异常时降级为精确文本唤醒，而不是绕过唤醒门控。
 
 ## 更新记录
+
+### 2026-10-28 · 三级缓冲与积压保护（输入 / 回复 / 合成）
+
+- **输入侧 VAD 串行队列**（`MAX_VAD_QUEUE=4`）：免手持模式下语音片段进入串行队列逐段处理；队列积压超过 4 段、或队首片段超过 `VAD_QUEUE_STALE_MS=6000ms` 时，只保留最新一段，丢弃过时片段，避免旧语音产生让人困惑的回复。整个排空循环不阻塞麦克风继续听下一段。
+- **回复侧 LLM 队列**：把原先「链式」`replyChain` 改为带界的 `replyQueue`（`MAX_REPLY_QUEUE=2`）。慢或卡住的对话模型调用从 VAD 流水线解耦——评估完一轮排空循环即返回，麦克风持续监听；积压时丢弃较早回复、仅回应最新一条（`REPLY_QUEUE_STALE_MS=4000ms`）。`clearAll` 时清空回复队列。
+- **合成侧 TTS 单并发退避**：上游 Breeze-TTS-2 只支持单并发、后端持全局锁，偶发 409。`ttsPlayer.js` 收到 409 后延迟 `TTS_BUSY_RETRY_DELAY_MS=400ms` 重试一次，仍失败才报错；播放本身仍是抢占式（新回复 `stopPlayback` 掐旧播放）。
+- 配套的「已实现」结论见 `todo.md`；跨 turn 合并经评估不做（决策语义绑定单 turn，VAD 切句合并已由后端 `pending_buffer` 覆盖）。
 
 ### 2026-10-27 · 移除 Hermes worker，对话统一由进程内 direct-LLM Agent 提供
 
