@@ -85,7 +85,7 @@
         <mxCell id="i6v5JZafEq-bte0j3bS9-4" edge="1" parent="layer_flow" source="i6v5JZafEq-bte0j3bS9-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="i6v5JZafEq-bte0j3bS9-3" value="">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="i6v5JZafEq-bte0j3bS9-1" parent="layer_flow" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;" value="LLM/Hermes" vertex="1">
+        <mxCell id="i6v5JZafEq-bte0j3bS9-1" parent="layer_flow" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;" value="LLM" vertex="1">
           <mxGeometry height="80" width="60" x="230" y="767" as="geometry" />
         </mxCell>
         <mxCell id="i6v5JZafEq-bte0j3bS9-6" edge="1" parent="layer_flow" source="i6v5JZafEq-bte0j3bS9-3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="i6v5JZafEq-bte0j3bS9-5" value="">
@@ -118,11 +118,8 @@
         <mxCell id="executor" parent="layer_exec" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=14;" value="AgentExecutor 统一接口&#xa;generate_response()&#xa;execute_task() / cancel_task()" vertex="1">
           <mxGeometry height="90" width="320" x="65" y="75" as="geometry" />
         </mxCell>
-        <mxCell id="directllm" parent="layer_exec" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;" value="DirectLLMExecutor&#xa;简单聊天 / 简短回应" vertex="1">
-          <mxGeometry height="75" width="170" x="35" y="220" as="geometry" />
-        </mxCell>
-        <mxCell id="hermes" parent="layer_exec" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;" value="HermesExecutor&#xa;复杂对话 / Agent 任务" vertex="1">
-          <mxGeometry height="75" width="170" x="245" y="220" as="geometry" />
+        <mxCell id="directllm" parent="layer_exec" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;" value="DirectLLM Agent&#xa;对话生成 / 技能与工具调用" vertex="1">
+          <mxGeometry height="75" width="200" x="125" y="220" as="geometry" />
         </mxCell>
         <mxCell id="tools" parent="layer_exec" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=14;" value="MCP / Skills / Tools&#xa;工具注册、调用与结果" vertex="1">
           <mxGeometry height="75" width="200" x="125" y="355" as="geometry" />
@@ -133,10 +130,7 @@
         <mxCell id="exec_direct" edge="1" parent="layer_exec" source="executor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;" target="directllm">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="exec_hermes" edge="1" parent="layer_exec" source="executor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;" target="hermes">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="exec_tools" edge="1" parent="layer_exec" source="hermes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;" target="tools">
+        <mxCell id="exec_tools" edge="1" parent="layer_exec" source="directllm" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;" target="tools">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="exec_actions" edge="1" parent="layer_exec" source="tools" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;" target="actions">
