@@ -703,6 +703,7 @@ class Session:
             "session_id": self.id,
             "active": self.is_active(),
             "active_remaining": round(self.active_remaining(), 1),
+            "participant_ids": sorted(self.participant_ids),
             "observed_speakers": [speaker.public() for speaker in observed],
             "buffer": buffer,
         }
@@ -732,6 +733,15 @@ class Session:
                 turn.speaker.display_name,
                 reply.preferred_name,
             )
+        for invited_id in reply.invited_speaker_ids:
+            if invited_id != turn.speaker.speaker_id:
+                self.participant_ids.add(invited_id)
+                logger.info(
+                    "invite session=%s inviter=%s invited=%s",
+                    self.id,
+                    turn.speaker.speaker_id,
+                    invited_id,
+                )
         return ChatReply(text=reply.text, instruction=reply.instruction)
 
     async def chat(self, turn_id: str) -> ChatReply:

@@ -429,6 +429,56 @@ def test_context_window_keeps_only_five_real_messages():
     assert [entry["text"] for entry in session.conversation_context] == ["1", "2", "3", "4", "5"]
 
 
+def test_invited_speaker_joins_participant_ids(monkeypatch):
+    from conversation_agent import AgentReply
+
+    session = Session(id="s")
+    turn = evaluate(session, "a", "志玲你好", active=False)
+
+    async def respond(agent_turn, _context):
+        assert agent_turn.speaker_id == "a"
+        return AgentReply(text="把老周拉进来了。", invited_speaker_ids=("user-b",))
+
+    monkeypatch.setattr(session.conversation_agent, "respond", respond)
+    asyncio.run(session.chat(turn.id))
+
+    assert session.participant_ids == {"a", "user-b"}
+    snapshot = session.snapshot()
+    assert snapshot["participant_ids"] == ["a", "user-b"]
+
+    # B can now pass the participant gate without a wake word. (In production
+    # the decision model is the authority on replying; the provisional flag
+    # only applies inside the active window, which decide_turn opens.)
+    session.activate()
+    b_turn = session.begin_turn("vad", False)
+    evaluated = session.evaluate_turn(
+        b_turn.id,
+        SpeakerIdentity(speaker_id="user-b", display_name="老周", identity_named=True),
+        b"audio",
+        text="今天天气怎么样",
+        language="zh",
+        kws_detected=False,
+        kws_keyword=None,
+    )
+    assert evaluated.should_reply is True
+    assert evaluated.reason == "在连续对话窗口内"
+
+
+def test_invite_of_current_speaker_is_noop(monkeypatch):
+    from conversation_agent import AgentReply
+
+    session = Session(id="s")
+    turn = evaluate(session, "a", "志玲你好", active=False)
+
+    async def respond(_agent_turn, _context):
+        return AgentReply(text="你已经在会话里了。", invited_speaker_ids=("a",))
+
+    monkeypatch.setattr(session.conversation_agent, "respond", respond)
+    asyncio.run(session.chat(turn.id))
+
+    assert session.participant_ids == {"a"}
+
+
 def test_real_reply_is_added_to_context(monkeypatch):
     session = Session(id="s")
     turn = evaluate(session, "a", "志玲你好", active=False)

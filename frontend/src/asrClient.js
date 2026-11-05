@@ -114,3 +114,8 @@ export async function chat(sessionId, turnId) {
   });
   return await jsonResponse(response, "chat");
 }
+
+export async function listVoiceprintUsers() {
+  const response = await fetch(`${BASE}/voiceprint/users`);
+  return await jsonResponse(response, "voiceprint users");
+}

@@ -10,6 +10,7 @@ import {
   touchSession,
   recordPerformance,
   chat,
+  listVoiceprintUsers,
 } from "./asrClient.js";
 import { playTts, stopPlayback } from "./ttsPlayer.js";
 import { startVad, stopVad, releaseSharedStream } from "./vad.js";
@@ -30,6 +31,10 @@ const activeRemaining = ref(0);
 const speakerId = ref("");
 const speakerCreated = ref(false);
 const voiceEvents = ref([]); // diagnostic history of recognized voices
+// 会话成员面板：当前在会话中的已注册说话人 / 已注册但不在会话中的说话人。
+const inSessionMembers = ref([]);
+const outOfSessionMembers = ref([]);
+const membersError = ref("");
 const voiceLogEl = ref(null);
 const logEl = ref(null);
 const asrEl = ref(null);
@@ -139,6 +144,59 @@ async function ensureSession() {
 function applySessionState(state) {
   if (!state) return;
   updateActive(state);
+  refreshMembers(state).catch(() => {});
+}
+
+let membersRefreshInFlight = null;
+async function refreshMembers(snapshot) {
+  if (!sessionId) return;
+  // Coalesce concurrent triggers (evaluate already returns a session snapshot;
+  // the VAD drain loop may fire again before the directory fetch resolves).
+  if (membersRefreshInFlight) await membersRefreshInFlight.catch(() => {});
+  membersRefreshInFlight = (async () => {
+    try {
+      const directory = await listVoiceprintUsers();
+      // /v1/users returns disabled accounts too; they must not appear in the
+      // panel and the backend invite skill refuses them — stay consistent.
+      const activeUsers = directory.filter((user) => user.is_active);
+      const byId = new Map(activeUsers.map((user) => [String(user.id), user]));
+      const participantIds = new Set(snapshot?.participant_ids || []);
+      const observedById = new Map(
+        (snapshot?.observed_speakers || []).map((speaker) => [String(speaker.speaker_id), speaker])
+      );
+      const displayName = (id) => {
+        const observed = observedById.get(id) || {};
+        const user = byId.get(id) || {};
+        return (
+          user.preferred_name ||
+          user.display_name ||
+          observed.preferred_name ||
+          observed.display_name ||
+          `用户 ${id.slice(0, 8)}`
+        );
+      };
+      const named = (id) => {
+        const user = byId.get(id) || {};
+        // Anonymous enrollments still carry a display_name like “访客 xxx”;
+        // a preferred_name means the user was explicitly named, i.e. registered.
+        return !!user.preferred_name || !(user.display_name || "").startsWith("访客 ");
+      };
+      inSessionMembers.value = [...participantIds].map((id) => ({
+        id,
+        name: displayName(id),
+        lastText: observedById.get(id)?.last_text || "",
+      }));
+      outOfSessionMembers.value = activeUsers
+        .filter((user) => named(String(user.id)) && !participantIds.has(String(user.id)))
+        .map((user) => ({ id: String(user.id), name: displayName(String(user.id)) }));
+      membersError.value = "";
+    } catch (err) {
+      membersError.value = err.message || "成员列表刷新失败";
+    } finally {
+      membersRefreshInFlight = null;
+    }
+  })();
+  await membersRefreshInFlight;
 }
 
 function speakerName(speaker) {
@@ -680,6 +738,33 @@ onBeforeUnmount(() => {
           {{ decisionDebug ? decisionDebug.at : "等待语音" }}
         </span>
       </header>
+
+      <!-- 会话成员：仅展示已注册用户，匿名访客不出现 -->
+      <section class="dp-stage dp-members">
+        <div class="dp-stage-head"><span class="dp-badge">M</span><h3>会话成员</h3></div>
+        <div v-if="membersError" class="dp-reason">{{ membersError }}</div>
+        <div class="dp-members-group">
+          <div class="dp-members-label">在会话中（{{ inSessionMembers.length }}）</div>
+          <div v-if="!inSessionMembers.length" class="dp-members-empty">还没有人加入，说唤醒词或让成员邀请</div>
+          <ul v-else class="dp-members-list">
+            <li v-for="member in inSessionMembers" :key="member.id" class="dp-member is-active">
+              <span class="speaker-dot"></span>
+              <span class="dp-member-name">{{ member.name }}</span>
+              <span v-if="member.lastText" class="dp-member-sub">最近：“{{ member.lastText }}”</span>
+            </li>
+          </ul>
+        </div>
+        <div class="dp-members-group">
+          <div class="dp-members-label">已注册未入会（{{ outOfSessionMembers.length }}）</div>
+          <div v-if="!outOfSessionMembers.length" class="dp-members-empty">没有其他已注册用户</div>
+          <ul v-else class="dp-members-list">
+            <li v-for="member in outOfSessionMembers" :key="member.id" class="dp-member">
+              <span class="dp-member-name">{{ member.name }}</span>
+              <span class="dp-member-sub">可说“把{{ member.name }}拉进会话”</span>
+            </li>
+          </ul>
+        </div>
+      </section>
 
       <div v-if="!decisionDebug" class="dp-empty">
         开启 VAD 说话后，这里会展示决策模型对这一轮的完整判断链路。
@@ -1380,6 +1465,46 @@ button:disabled {
 .dp-judge .dp-badge { background: #7c3aed; }
 .dp-result .dp-badge { background: #16a34a; }
 .dp-result.is-silent .dp-badge { background: #94a3b8; }
+.dp-members {
+  margin: 14px 14px 0;
+  max-height: 32%;
+  overflow-y: auto;
+}
+.dp-members .dp-badge { background: #d97706; }
+.dp-members-group { margin-top: 10px; }
+.dp-members-label {
+  font-size: 12px;
+  color: #64748b;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.dp-members-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.dp-member {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #f1f5f9;
+  font-size: 13px;
+  color: #334155;
+}
+.dp-member.is-active {
+  background: #ecfdf5;
+  border-left: 3px solid #16a34a;
+}
+.dp-member .speaker-dot { flex-shrink: 0; }
+.dp-member-name { font-weight: 600; color: #0f172a; }
+.dp-member-sub { font-size: 12px; color: #64748b; }
+.dp-members-empty { font-size: 12px; color: #94a3b8; padding: 4px 2px; }
 .dp-quote {
   color: #334155;
   font-size: 14px;

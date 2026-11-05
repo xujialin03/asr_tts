@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 import config
+from session_skill import INVITE_SPEAKER, InviteStatus, SessionInviteSkill
 from teleop_skill import TeleopMCPSkill
 from voiceprint_skill import SET_CURRENT_PREFERRED_NAME, VoiceprintManagementSkill
 
@@ -31,6 +32,8 @@ SYSTEM_PROMPT = """你是志玲，一名温柔、自然、愿意陪伴用户聊�
 若 VOICE_CONTEXT 中 `should_ask_name` 为 true，说明当前成员刚通过唤醒词加入、但声纹身份仍是匿名访客，本次会话尚未问过称呼。自然回应当前内容后，明确而简短地问一次“我该怎么称呼你？”。若为 false，不要主动重复询问姓名。用户没有回答名字时不要阻塞或追问，后续正常聊天。
 
 当且仅当用户明确自报称呼（例如“我叫许老板”“叫我许老板”）时，必须在 actions 中调用下方项目技能保存称呼；不要只在文字里口头记住。用户没有明确报称呼时 actions 必须为空数组。
+
+当且仅当用户明确要求把某个已注册的人拉进当前会话（例如“把老周拉进来”“邀请小敏加入会话”）时，在 actions 中调用 session.invite_speaker 并传入 TA 的称呼；闲聊或含糊提及某人名字时不要调用。技能失败时会返回一句现成的说明，直接转述给用户即可；成功时口头确认 TA 已加入。
 
 可用项目技能：{skills}
 {teleop_rules}
@@ -141,6 +144,7 @@ class AgentReply:
     text: str
     instruction: str = ""
     preferred_name: str | None = None
+    invited_speaker_ids: tuple[str, ...] = ()
 
 
 class VoiceConversationAgent:
@@ -148,7 +152,7 @@ class VoiceConversationAgent:
 
     def _system_message(self) -> str:
         aliases = "、".join(f"“{word}”" for word in config.WAKE_WORDS if word)
-        skills = [VoiceprintManagementSkill.action_definition()]
+        skills = [VoiceprintManagementSkill.action_definition(), SessionInviteSkill.action_definition()]
         teleop_rules = ""
         if config.TELEOP_ENABLED:
             skills.extend(TeleopMCPSkill.definitions())
@@ -222,15 +226,16 @@ class VoiceConversationAgent:
 
     async def _execute_actions(
         self, turn: AgentTurn, actions: list[dict[str, Any]]
-    ) -> tuple[str | None, str, dict[str, Any] | None]:
-        """Execute the single action. Returns (preferred_name, narration_text, narration_meta).
+    ) -> tuple[str | None, str, dict[str, Any] | None, tuple[str, ...]]:
+        """Execute the single action.
 
+        Returns (preferred_name, narration_text, narration_meta, invited_ids).
         Voiceprint is a silent side effect (the model's own text covers it).
         Teleop actions return data the user must hear, so narration_text is the
         skill's fallback summary; respond() upgrades it via a second model pass.
         """
         if not actions:
-            return None, "", None
+            return None, "", None, ()
         action = actions[0]
         name = action.get("name")
         if not isinstance(name, str):
@@ -242,20 +247,34 @@ class VoiceConversationAgent:
                 action.get("arguments"),
             )
             if result.action == SET_CURRENT_PREFERRED_NAME:
-                return result.preferred_name, "", None
+                return result.preferred_name, "", None, ()
             raise RuntimeError(f"unhandled voiceprint skill action: {result.action}")
+        if name == INVITE_SPEAKER:
+            try:
+                result = await SessionInviteSkill().execute(name, action.get("arguments"))
+            except Exception as exc:  # directory lookup failure: tell the user, don't crash the turn
+                logger.warning("session invite skill failed: %s", exc)
+                return None, "抱歉，我这边查不到用户目录，邀请没有成功。", None, ()
+            if result.status is InviteStatus.INVITED and result.speaker_id:
+                return None, "", None, (result.speaker_id,)
+            if result.status is InviteStatus.AMBIGUOUS:
+                return None, (
+                    f"用户目录里有 {result.match_count} 个人匹配这个称呼，"
+                    "请说全名或用更明确的称呼，我再拉 TA 进来。"
+                ), None, ()
+            return None, "没有找到这个已注册的用户，TA 需要先注册声纹，或自己说唤醒词加入。", None, ()
         if config.TELEOP_ENABLED and TeleopMCPSkill.is_supported(name):
             try:
                 result = await TeleopMCPSkill().execute(name, action.get("arguments"))
             except Exception as exc:  # network/contract failure: tell the user, don't crash the turn
                 logger.warning("teleop skill %s failed: %s", name, exc)
-                return None, "抱歉，我这边连不上遥操服务，稍后再试。", None
+                return None, "抱歉，我这边连不上遥操服务，稍后再试。", None, ()
             meta = {
                 "action": result.action,
                 "ok": result.ok,
                 "payload": _narration_payload(result.action, result.structured),
             }
-            return None, result.fallback_summary, meta
+            return None, result.fallback_summary, meta, ()
         raise RuntimeError(f"unknown skill action: {name}")
 
     async def _chat(self, messages: list[dict[str, str]]) -> str:
@@ -309,7 +328,7 @@ class VoiceConversationAgent:
         started = time.monotonic()
         messages = self._messages(turn, context)
         text, instruction, actions = self._parse_reply(await self._chat(messages))
-        preferred_name, tool_text, tool_meta = await self._execute_actions(turn, actions)
+        preferred_name, tool_text, tool_meta, invited_ids = await self._execute_actions(turn, actions)
         if tool_text:
             # Teleop result: prefer a model-narrated update over the raw summary.
             if tool_meta and tool_meta["ok"]:
@@ -327,4 +346,9 @@ class VoiceConversationAgent:
             time.monotonic() - started,
             actions[0].get("name") if actions else None,
         )
-        return AgentReply(text=text, instruction=instruction, preferred_name=preferred_name)
+        return AgentReply(
+            text=text,
+            instruction=instruction,
+            preferred_name=preferred_name,
+            invited_speaker_ids=invited_ids,
+        )

@@ -40,6 +40,7 @@ def test_messages_include_current_member_context_and_only_valid_history():
 
     assert messages[0]["role"] == "system"
     assert "voiceprint.set_current_preferred_name" in messages[0]["content"]
+    assert "session.invite_speaker" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "[用户 speaker-] 前一句"}
     assert messages[2] == {"role": "assistant", "content": "收到"}
     assert len(messages) == 4
@@ -107,7 +108,7 @@ def test_execute_actions_is_bound_to_turn_speaker(monkeypatch):
         return VoiceprintSkillResult(action=name, preferred_name="许老板")
 
     monkeypatch.setattr("conversation_agent.VoiceprintManagementSkill.execute", execute)
-    name, tool_text, tool_meta = asyncio.run(
+    name, tool_text, tool_meta, invited_ids = asyncio.run(
         agent._execute_actions(
             turn(speaker_id="speaker-current"),
             [{
@@ -120,6 +121,7 @@ def test_execute_actions_is_bound_to_turn_speaker(monkeypatch):
     assert name == "许老板"
     assert tool_text == ""
     assert tool_meta is None
+    assert invited_ids == ()
     assert captured["speaker_id"] == "speaker-current"
     assert captured["arguments"]["speaker_id"] == "attacker"
 
@@ -139,7 +141,7 @@ def test_execute_actions_routes_teleop_when_enabled(monkeypatch):
         )
 
     monkeypatch.setattr("conversation_agent.TeleopMCPSkill.execute", execute)
-    name, tool_text, tool_meta = asyncio.run(
+    name, tool_text, tool_meta, invited_ids = asyncio.run(
         agent._execute_actions(
             turn(),
             [{"name": "teleop.start_teleoperation", "arguments": {}}],
@@ -147,10 +149,79 @@ def test_execute_actions_routes_teleop_when_enabled(monkeypatch):
     )
 
     assert name is None
+    assert invited_ids == ()
     assert tool_text == "遥操已启动。"
     assert tool_meta["action"] == "teleop.start_teleoperation"
     assert tool_meta["ok"] is True
     assert "running" in tool_meta["payload"]
+
+
+def test_execute_actions_routes_invite_success(monkeypatch):
+    from session_skill import InviteSkillResult, InviteStatus
+
+    agent = VoiceConversationAgent()
+
+    async def execute(self, action, arguments):
+        return InviteSkillResult(action, InviteStatus.INVITED, speaker_id="user-b", display_name="老周")
+
+    monkeypatch.setattr("conversation_agent.SessionInviteSkill.execute", execute)
+    name, tool_text, tool_meta, invited_ids = asyncio.run(
+        agent._execute_actions(turn(), [{"name": "session.invite_speaker", "arguments": {"preferred_name": "老周"}}])
+    )
+
+    assert name is None
+    assert tool_text == ""
+    assert tool_meta is None
+    assert invited_ids == ("user-b",)
+
+
+def test_execute_actions_invite_not_found_narrates_failure(monkeypatch):
+    from session_skill import InviteSkillResult, InviteStatus
+
+    agent = VoiceConversationAgent()
+
+    async def execute(self, action, arguments):
+        return InviteSkillResult(action, InviteStatus.NOT_FOUND)
+
+    monkeypatch.setattr("conversation_agent.SessionInviteSkill.execute", execute)
+    name, tool_text, tool_meta, invited_ids = asyncio.run(
+        agent._execute_actions(turn(), [{"name": "session.invite_speaker", "arguments": {"preferred_name": "不存在"}}])
+    )
+
+    assert invited_ids == ()
+    assert "没有找到" in tool_text
+
+
+def test_execute_actions_invite_ambiguous_narrates_and_holds(monkeypatch):
+    from session_skill import InviteSkillResult, InviteStatus
+
+    agent = VoiceConversationAgent()
+
+    async def execute(self, action, arguments):
+        return InviteSkillResult(action, InviteStatus.AMBIGUOUS, match_count=2)
+
+    monkeypatch.setattr("conversation_agent.SessionInviteSkill.execute", execute)
+    name, tool_text, tool_meta, invited_ids = asyncio.run(
+        agent._execute_actions(turn(), [{"name": "session.invite_speaker", "arguments": {"preferred_name": "张伟"}}])
+    )
+
+    assert invited_ids == ()
+    assert "2 个人" in tool_text
+
+
+def test_execute_actions_invite_http_failure_degrades_to_notice(monkeypatch):
+    agent = VoiceConversationAgent()
+
+    async def boom(self, action, arguments):
+        raise RuntimeError("voiceprint down")
+
+    monkeypatch.setattr("conversation_agent.SessionInviteSkill.execute", boom)
+    name, tool_text, tool_meta, invited_ids = asyncio.run(
+        agent._execute_actions(turn(), [{"name": "session.invite_speaker", "arguments": {"preferred_name": "老周"}}])
+    )
+
+    assert invited_ids == ()
+    assert "查不到用户目录" in tool_text
 
 
 def test_execute_actions_rejects_unknown_skill(monkeypatch):
