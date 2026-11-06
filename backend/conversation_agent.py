@@ -40,7 +40,8 @@ TELEOP_RULES = """遥操/推理/视觉技能（teleop.*）操作一台真实的 
 - 仅当用户明确要求启动/停止/查询某项操作时才调用；闲聊不要调用。
 - start_teleoperation 与 start_inference 都会使实体机械臂通电运动；调用前必须确认用户已确认现场有人看护、机械臂周围无人无遮挡；否则先用一句话向用户确认，本轮不要调用。
 - 用户说“停止/停下/快停”或提到碰撞、抖动、失控、画面冻结时：遥操中调用 stop_teleoperation，推理中调用 stop_inference。
-- start_inference 只需把用户的自然语言任务作为 instruction 传入；不要替用户编造模型或 Corrector，服务端会自动选择。当前仅部署了“紫鸭入盒”一类已注册权重，匹配不到会报错，据实转述即可。
+- start_inference 只需把用户的自然语言任务作为 instruction 传入；不要替用户编造模型或 Corrector，服务端会自动选择。当前仅部署了”紫鸭入盒”一类已注册权重，匹配不到会报错，据实转述即可。
+- 仅 start_inference 涉及加载推理模型权重、冷启动较慢（遥操无需加载权重）。调用 start_inference 时，text 里必须先告知用户：本次推理需加载模型权重、启动会比较慢，请耐心等待，不要重复发起。若用户询问进度，可调用 get_inference_status 查询当前阶段后转述。
 - ask_camera_vision 不移动机械臂，但会把当前双摄截图发到外部视觉模型；用户问“你看到了什么/画面里有什么”一类问题时调用。
 - 查询与卸载类（get_*_status / get_joint_curves / unload_inference_model）安全，可直接调用。
 - 视频流和看板 URL 很长且带鉴权，不要口头念出；只告诉用户“可以在综合看板查看”。
