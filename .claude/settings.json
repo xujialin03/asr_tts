@@ -197,7 +197,16 @@
       "Bash(docker exec zhiling-postgres psql -U qwen3_asr -d qwen3_asr -t -A -F'|' -c \" *)",
       "Bash(python3)",
       "Bash(sed -n '/async def active_embeddings/,/return/p' voiceprint-service/app/database.py)",
-      "Bash(sed -n '/async def list_users/,/return/p' voiceprint-service/app/database.py)"
+      "Bash(sed -n '/async def list_users/,/return/p' voiceprint-service/app/database.py)",
+      "Bash(curl -s -m 3 -w \"[%{http_code}]\" http://127.0.0.1:8000/health)",
+      "Bash(curl -s -m 8 -w \"\\\\n[%{http_code}]\" http://36.212.51.180:8000/v1/models)",
+      "Bash(nc -z -w 5 36.212.51.180 8000)",
+      "Bash(curl -s -m 8 -w \"\\\\n[%{http_code}]\" http://36.212.138.62:9090/v1/models)",
+      "Bash(nc -z -w 5 36.212.138.62 9090)",
+      "Bash(curl -s -m 8 -H \"Authorization: Bearer empty\" -w \"\\\\n[%{http_code}]\" http://36.212.138.62:9090/v1/models)",
+      "Bash(curl -s -m 20 -X POST http://36.212.138.62:9090/v1/chat/completions -H \"Authorization: Bearer empty\" -H \"Content-Type: application/json\" -d '{\"model\":\"qwen3.8-flash-next-iq3_s\",\"messages\":[{\"role\":\"user\",\"content\":\"回复一个JSON: {\\\\\"ok\\\\\":true}\"}],\"max_tokens\":32,\"response_format\":{\"type\":\"json_object\"}}')",
+      "Bash(curl -s -m 30 -X POST http://36.212.138.62:9090/v1/chat/completions -H \"Authorization: Bearer empty\" -H \"Content-Type: application/json\" -d '{\"model\":\"qwen3.8-flash-next-iq3_s\",\"messages\":[{\"role\":\"user\",\"content\":\"回复一个JSON对象:{\\\\\"ok\\\\\":true}\"}],\"max_tokens\":256,\"response_format\":{\"type\":\"json_object\"}}')",
+      "Bash(node --input-type=module -e ' *)"
     ],
     "additionalDirectories": [
       "/tmp"

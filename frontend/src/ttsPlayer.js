@@ -21,11 +21,16 @@ let current = null; // active session handle, so a new one can cancel the old
 // every boundary resets prosody and can drift the timbre slightly. We therefore
 // only split when a reply is long enough that the latency/latency tradeoff is
 // worth the seams: replies under NO_SPLIT_UNDER_CHARS play as one clip (most
-// stable voice), and long replies split at a larger cap so there are fewer
-// boundaries. MIN avoids tiny fragments ("好的。" style).
-const NO_SPLIT_UNDER_CHARS = 80;
-const MAX_SEGMENT_CHARS = 70;
+// stable voice), and long replies split at a smaller cap so first-chunk latency
+// stays low. Empirically ~50 chars is where the remote TTS stays responsive, so
+// that's the hard cap. The 65 floor leaves a 15-char buffer so a reply just over
+// the cap doesn't collapse into a 50+near-empty-tail seam.
+const NO_SPLIT_UNDER_CHARS = 65;
+const MAX_SEGMENT_CHARS = 50;
+// Primary sentence-final breaks (preferred cut points), then weaker breaks used
+// to split a single sentence that's still longer than the cap.
 const SOFT_BREAKS = ["。", "！", "？", "；", "!", "?", ";", "\n"];
+const CLAUSE_BREAKS = ["，", ",", "、", "：", ":", " "];
 
 // A segment whose headers take longer than this is flagged as slow so it shows up
 // in the timing log / perf records rather than hiding inside "synthesizing".
@@ -41,9 +46,43 @@ function audioCtx() {
   return ctx;
 }
 
-// Split one reply into short, speakable segments. Strategy: first cut at
-// sentence-final punctuation (so boundaries never fall mid-sentence), then
-// greedily pack consecutive sentences into segments up to maxChars. Keeps
+// Split a clause-final chunk into <=maxChars pieces, cutting mid-clause only if
+// a piece has no sub-punctuation at all.
+function hardWrap(piece, maxChars) {
+  if (piece.length <= maxChars) return [piece];
+  const out = [];
+  let rest = piece;
+  while (rest.length > maxChars) {
+    const head = rest.slice(0, maxChars);
+    const cut = lastBreakIndex(head);
+    if (cut <= 0) {
+      // No sub-punctuation in range: force a hard cut at the cap.
+      out.push(head);
+      rest = rest.slice(maxChars);
+    } else {
+      out.push(head.slice(0, cut));
+      rest = rest.slice(cut);
+    }
+  }
+  if (rest.trim()) out.push(rest);
+  return out;
+}
+
+// Index just past the rightmost sub-clause break in s, or -1 if none. We take
+// the rightmost break of any type so each wrapped piece stays near the cap.
+function lastBreakIndex(s) {
+  let best = -1;
+  for (const b of CLAUSE_BREAKS) {
+    const i = s.lastIndexOf(b);
+    if (i > best) best = i;
+  }
+  return best === -1 ? -1 : best + 1; // break after the punctuation/space
+}
+
+// Split one reply into short, speakable segments. Strategy: cut at sentence-
+// final punctuation, then greedily pack sentences into segments up to maxChars;
+// a single sentence longer than the cap is further cut at sub-clause breaks
+// (hardWrap) so we never emit an over-long (slow-to-synthesize) clip. Keeps
 // punctuation attached to the text before it. Never returns empty strings.
 export function splitSegments(text, maxChars = MAX_SEGMENT_CHARS) {
   const clean = (text || "").replace(/\s+/g, " ").trim();
@@ -64,16 +103,23 @@ export function splitSegments(text, maxChars = MAX_SEGMENT_CHARS) {
   }
   if (buf.trim()) sentences.push(buf);
 
-  // 2. Greedily pack sentences into segments up to maxChars. A single sentence
-  //    longer than maxChars is emitted whole (we never cut mid-sentence).
+  // 2. Expand any sentence longer than the cap into <=maxChars pieces, cutting
+  //    at sub-clause punctuation where possible.
+  const units = [];
+  for (const sentence of sentences) {
+    if (sentence.length <= maxChars) units.push(sentence);
+    else units.push(...hardWrap(sentence, maxChars));
+  }
+
+  // 3. Greedily pack units into segments up to maxChars.
   const segments = [];
   let seg = "";
-  for (const sentence of sentences) {
-    if (seg && (seg + sentence).trim().length > maxChars) {
+  for (const unit of units) {
+    if (seg && (seg + unit).trim().length > maxChars) {
       segments.push(seg.trim());
       seg = "";
     }
-    seg += sentence;
+    seg += unit;
   }
   if (seg.trim()) segments.push(seg.trim());
   return segments;

@@ -622,6 +622,17 @@ class Session:
             turn.joined_session = True
         turn.audio_ref = self.store_voice_audio(audio, identity.speaker_id, turn.id)
 
+        # Observe every resolved identity — including registered speakers who
+        # have not joined yet, so the members panel can surface them as
+        # invitable. Observation is diagnostic only; it grants no reply.
+        # Skip while the assistant is playing: browser echoCancellation rarely
+        # removes the TTS entirely, and one long reply gets re-ingested as
+        # several segments that can each match a different template — the
+        # panel would then light up with ghosts. Joined speakers keep their
+        # interrupt path below.
+        if not turn.assistant_speaking:
+            self._observe(identity, text)
+
         # A speaker must explicitly enter this Session with a wake word. Once
         # joined, they can continue naturally; voices outside the participant
         # set are deliberately ignored even while the room is active.
@@ -629,8 +640,6 @@ class Session:
             turn.reason = "未加入当前会话：需要先说唤醒词"
             turn.evaluated = True
             return turn
-
-        self._observe(identity, text)
 
         if turn.assistant_speaking:
             matched, remainder = self.match_interrupt(text)

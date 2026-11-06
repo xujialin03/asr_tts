@@ -149,7 +149,9 @@ def test_active_nonparticipant_is_filtered_until_they_wake():
     assert turn.should_reply is False
     assert turn.reason == "未加入当前会话：需要先说唤醒词"
     assert "b" not in session.participant_ids
-    assert "b" not in session.observed_speakers
+    # Observed (so the members panel can offer them as invitable) but not
+    # admitted: observation is diagnostic only and grants no reply.
+    assert "b" in session.observed_speakers
 
 
 def test_second_speaker_joins_with_wake_even_while_session_is_active():
@@ -165,6 +167,24 @@ def test_second_speaker_joins_with_wake_even_while_session_is_active():
     assert "b" in session.observed_speakers
 
 
+def test_playback_echo_is_not_observed():
+    """TTS re-captured by the mic must not light up the members panel.
+
+    browser echoCancellation is imperfect: one long reply gets re-cut into
+    several segments that can each match a different template, surfacing
+    ghosts of every registered user. Joined speakers keep their interrupt
+    path, which runs after this gate.
+    """
+    session = Session(id="s")
+    evaluate(session, "a", "志玲你好", active=False)
+
+    turn = evaluate(session, "b", "外放回声", active=True, assistant_speaking=True)
+
+    assert "b" not in session.observed_speakers
+    assert "b" not in session.participant_ids
+    assert turn.reason == "未加入当前会话：需要先说唤醒词"
+
+
 def test_interrupt_applies_only_to_joined_speakers():
     session = Session(id="s")
     evaluate(session, "a", "志玲你好", active=False)
@@ -178,7 +198,7 @@ def test_interrupt_applies_only_to_joined_speakers():
     assert member.should_reply is False
 
 
-def test_empty_room_ordinary_speech_is_not_observed_or_admitted():
+def test_empty_room_ordinary_speech_is_observed_but_not_admitted():
     session = Session(id="s")
 
     turn = evaluate(session, "a", "你好", active=False)
@@ -186,7 +206,10 @@ def test_empty_room_ordinary_speech_is_not_observed_or_admitted():
     assert turn.wake_event is False
     assert turn.should_reply is False
     assert turn.reason == "未加入当前会话：需要先说唤醒词"
-    assert session.observed_speakers == {}
+    # Speaker is tracked for the members panel (registered-only filter happens
+    # on the frontend), but no reply path is opened.
+    assert set(session.observed_speakers) == {"a"}
+    assert session.participant_ids == set()
 
 
 def test_audio_refs_do_not_overwrite_each_other():

@@ -186,9 +186,11 @@ async function refreshMembers(snapshot) {
         name: displayName(id),
         lastText: observedById.get(id)?.last_text || "",
       }));
-      outOfSessionMembers.value = activeUsers
-        .filter((user) => named(String(user.id)) && !participantIds.has(String(user.id)))
-        .map((user) => ({ id: String(user.id), name: displayName(String(user.id)) }));
+      // Only voices actually heard in this session qualify for the waiting
+      // list; the directory alone (never spoken) must not show up.
+      outOfSessionMembers.value = [...observedById.keys()]
+        .filter((id) => !participantIds.has(id) && named(id))
+        .map((id) => ({ id, name: displayName(id) }));
       membersError.value = "";
     } catch (err) {
       membersError.value = err.message || "成员列表刷新失败";
